@@ -809,7 +809,7 @@ def main():
                         help="Checkpoint to resume from")
     parser.add_argument("--overfit-batches", type=int, default=0,
                         help="Train on N batches only (debug)")
-parser.add_argument("--log-every", type=int, default=50,
+    parser.add_argument("--log-every", type=int, default=50,
                         help="Log to wandb every N steps (default: 50)")
     args = parser.parse_args()
     train(args)
