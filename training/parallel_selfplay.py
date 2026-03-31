@@ -260,7 +260,7 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
 
         # ---- Move selection + example recording ----
         completed = []
-        next_gid = next_game_id_start + batch_size  # approximate
+        next_gid = next_game_id_start + batch_size + worker_id
         for i, slot in enumerate(slots):
             turn = slot.turn_number
             temp = 1.0 if turn < 20 else late_temperature
@@ -354,7 +354,7 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                 # Replace with fresh game
                 slot.game = _new_game()
                 slot.game_id = next_gid
-                next_gid += 1
+                next_gid += n_workers
                 slot.examples = []
                 slot.turn_number = 0
 
