@@ -6,6 +6,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import random
 import time
@@ -20,7 +21,7 @@ from tqdm import tqdm
 from game import HexGame, HEX_DIRECTIONS, Player
 from model.resnet import BOARD_SIZE, HexResNet, board_to_planes_torus
 from model.symmetry import (
-    apply_symmetry_planes, PERMS, N as SYM_N,
+    apply_symmetry_planes, apply_symmetry_chain, PERMS, N as SYM_N,
 )
 
 try:
@@ -35,7 +36,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def _precompute_chain_tables(N=BOARD_SIZE, win_len=6):
-    """Precompute window cell indices and per-cell window membership."""
+    """Precompute window cell indices and per-direction cell membership."""
     n_windows = N * N * 3  # 3 directions
     win_qs = np.zeros((n_windows, win_len), dtype=np.int32)
     win_rs = np.zeros((n_windows, win_len), dtype=np.int32)
@@ -49,35 +50,42 @@ def _precompute_chain_tables(N=BOARD_SIZE, win_len=6):
                     win_rs[w_idx, i] = (sr + i * dr) % N
                 w_idx += 1
 
-    # Cell-to-windows: for each cell, which windows contain it
-    membership = [[] for _ in range(N * N)]
-    for w in range(n_windows):
-        for i in range(win_len):
-            flat = win_qs[w, i] * N + win_rs[w, i]
-            membership[flat].append(w)
+    # Per-direction cell-to-windows membership
+    n_per_dir = N * N
+    cell_windows_per_dir = []
+    cell_masks_per_dir = []
+    for d in range(3):
+        start = d * n_per_dir
+        end = start + n_per_dir
+        membership = [[] for _ in range(N * N)]
+        for w in range(start, end):
+            for i in range(win_len):
+                flat = win_qs[w, i] * N + win_rs[w, i]
+                membership[flat].append(w)
+        max_per = max(len(m) for m in membership)
+        cw = np.zeros((N * N, max_per), dtype=np.int32)
+        cm = np.zeros((N * N, max_per), dtype=bool)
+        for idx, m in enumerate(membership):
+            cw[idx, :len(m)] = m
+            cm[idx, :len(m)] = True
+        cell_windows_per_dir.append(cw)
+        cell_masks_per_dir.append(cm)
 
-    max_per_cell = max(len(m) for m in membership)
-    cell_windows = np.zeros((N * N, max_per_cell), dtype=np.int32)
-    cell_mask = np.zeros((N * N, max_per_cell), dtype=bool)
-    for idx, m in enumerate(membership):
-        cell_windows[idx, :len(m)] = m
-        cell_mask[idx, :len(m)] = True
-
-    return win_qs, win_rs, cell_windows, cell_mask
+    return win_qs, win_rs, cell_windows_per_dir, cell_masks_per_dir
 
 
-_WIN_QS, _WIN_RS, _CELL_WINDOWS, _CELL_MASK = _precompute_chain_tables()
+_WIN_QS, _WIN_RS, _CW_PER_DIR, _CM_PER_DIR = _precompute_chain_tables()
+
+
+CHAIN_VERSION = 2  # bump when chain target shape changes
 
 
 def compute_chain_targets(board_dict, current_player):
-    """Compute chain length targets [2, N, N] and loss mask [2, N, N].
+    """Compute per-direction chain targets [6, N, N] and mask [6, N, N].
 
-    Channel 0: current player's max unblocked chain through each cell.
-    Channel 1: opponent's max unblocked chain through each cell.
-
-    Mask: 0 on cells occupied by the other player (since those block chains).
-
-    current_player: int (1 or 2), must match board_dict value types.
+    Channels 0-2: current player, directions 0, 1, 2.
+    Channels 3-5: opponent, directions 0, 1, 2.
+    Mask: 0 on cells occupied by the other player.
     """
     N = BOARD_SIZE
     cp = int(current_player)
@@ -90,29 +98,39 @@ def compute_chain_targets(board_dict, current_player):
         else:
             opp_board[q, r] = 1
 
-    targets = np.zeros((2, N, N), dtype=np.float32)
+    # Precompute per-window counts once (shared across directions)
+    player_in_cur = cur_board[_WIN_QS, _WIN_RS]    # [n_windows, 6]
+    blocker_in_cur = opp_board[_WIN_QS, _WIN_RS]
+    player_in_opp = blocker_in_cur                   # opponent's stones
+    blocker_in_opp = player_in_cur
 
-    for ch, (player_b, blocker_b) in enumerate(
-            [(cur_board, opp_board), (opp_board, cur_board)]):
-        # Count player stones in each window
-        player_in = player_b[_WIN_QS, _WIN_RS]    # [n_windows, 6]
-        blocker_in = blocker_b[_WIN_QS, _WIN_RS]   # [n_windows, 6]
-        counts = player_in.sum(axis=1)              # [n_windows]
-        blocked = blocker_in.any(axis=1)            # [n_windows]
+    targets = np.zeros((6, N, N), dtype=np.float32)
+
+    for ch_base, (p_in, b_in) in enumerate(
+            [(player_in_cur, blocker_in_cur),
+             (player_in_opp, blocker_in_opp)]):
+        counts = p_in.sum(axis=1)              # [n_windows]
+        blocked = b_in.any(axis=1)             # [n_windows]
         unblocked = np.where(blocked, 0, counts).astype(np.float32)
 
-        # For each cell, max unblocked count across its windows
-        vals = unblocked[_CELL_WINDOWS]             # [N*N, max_per_cell]
-        vals[~_CELL_MASK] = 0
-        targets[ch] = vals.max(axis=1).reshape(N, N)
+        for d in range(3):
+            cw = _CW_PER_DIR[d]
+            cm = _CM_PER_DIR[d]
+            vals = unblocked[cw]               # [N*N, max_per_dir]
+            vals[~cm] = 0
+            targets[ch_base * 3 + d] = vals.max(axis=1).reshape(N, N)
 
-    # Loss mask: don't predict opponent chains on current player's cells
-    mask = np.ones((2, N, N), dtype=np.float32)
+    # Loss mask: don't predict on cells occupied by the other player
+    mask = np.ones((6, N, N), dtype=np.float32)
     for (q, r), p in board_dict.items():
         if p == cp:
-            mask[1, q, r] = 0.0   # mask opponent channel on current's cells
+            mask[3, q, r] = 0.0   # mask opp channels on current's cells
+            mask[4, q, r] = 0.0
+            mask[5, q, r] = 0.0
         else:
-            mask[0, q, r] = 0.0   # mask current channel on opponent's cells
+            mask[0, q, r] = 0.0   # mask current channels on opp's cells
+            mask[1, q, r] = 0.0
+            mask[2, q, r] = 0.0
 
     return torch.from_numpy(targets), torch.from_numpy(mask)
 
@@ -135,8 +153,8 @@ class SelfPlayDataset(torch.utils.data.Dataset):
         self.planes = planes              # [N, 2, 25, 25]
         self.visit_dicts = visit_dicts    # list of list[(flat_pair_idx, prob)]
         self.values = values              # [N]
-        self.chain_targets = chain_targets  # [N, 2, 25, 25]
-        self.chain_masks = chain_masks    # [N, 2, 25, 25]
+        self.chain_targets = chain_targets  # [N, 6, 25, 25]
+        self.chain_masks = chain_masks    # [N, 6, 25, 25]
         self.moves_left = moves_left      # [N]
         self.draw_mask = draw_mask        # [N] bool — True = drawn, mask out
         self.augment = augment
@@ -152,8 +170,8 @@ class SelfPlayDataset(torch.utils.data.Dataset):
         planes = self.planes[idx]
         value = self.values[idx]
         visit_entries = self.visit_dicts[idx]
-        chain_t = self.chain_targets[idx]   # [2, 25, 25]
-        chain_m = self.chain_masks[idx]     # [2, 25, 25]
+        chain_t = self.chain_targets[idx]   # [6, 25, 25]
+        chain_m = self.chain_masks[idx]     # [6, 25, 25]
         ml = self.moves_left[idx]
         drawn = self.draw_mask[idx]
 
@@ -164,8 +182,8 @@ class SelfPlayDataset(torch.utils.data.Dataset):
 
         if k != 0:
             planes = apply_symmetry_planes(planes, k)
-            chain_t = apply_symmetry_planes(chain_t, k)
-            chain_m = apply_symmetry_planes(chain_m, k)
+            chain_t = apply_symmetry_chain(chain_t, k)
+            chain_m = apply_symmetry_chain(chain_m, k)
 
         # Build dense visit vector, applying symmetry to sparse entries
         NN = self._NN
@@ -224,8 +242,8 @@ def _load_sft_examples(parquet_path: str, max_examples: int = 50000):
     planes_tensor = torch.zeros(n, 2, bs, bs)
     visit_dicts: list[list[tuple[int, float]]] = []
     value_tensor = torch.zeros(n)
-    chain_targets = torch.zeros(n, 2, bs, bs)
-    chain_masks = torch.zeros(n, 2, bs, bs)
+    chain_targets = torch.zeros(n, 6, bs, bs)
+    chain_masks = torch.zeros(n, 6, bs, bs)
 
     boards = df["board"].values
     cps = df["current_player"].values
@@ -293,9 +311,12 @@ def _preprocess_round(parquet_path: str) -> dict:
     if os.path.exists(cache_path):
         if os.path.getmtime(cache_path) >= os.path.getmtime(parquet_path):
             d = torch.load(cache_path, weights_only=False)
-            n = len(d['values'])
-            print(f"  {os.path.basename(parquet_path)}: {n:,} examples (cached)")
-            return d
+            if d.get('chain_version', 1) == CHAIN_VERSION:
+                n = len(d['values'])
+                print(f"  {os.path.basename(parquet_path)}: {n:,} examples (cached)")
+                return d
+            print(f"  Chain version mismatch, recomputing cache for "
+                  f"{os.path.basename(parquet_path)}")
 
     df = pd.read_parquet(parquet_path)
     n = len(df)
@@ -306,8 +327,8 @@ def _preprocess_round(parquet_path: str) -> dict:
     visit_dicts = []
     values = torch.zeros(n)
     rids = torch.zeros(n, dtype=torch.int64)
-    chain_t = torch.zeros(n, 2, bs, bs)
-    chain_m = torch.zeros(n, 2, bs, bs)
+    chain_t = torch.zeros(n, 6, bs, bs)
+    chain_m = torch.zeros(n, 6, bs, bs)
     ml = torch.zeros(n)
     dm = torch.zeros(n, dtype=torch.bool)
     has_ml = "moves_left" in df.columns
@@ -348,6 +369,7 @@ def _preprocess_round(parquet_path: str) -> dict:
         'values': values, 'round_ids': rids,
         'chain_targets': chain_t, 'chain_masks': chain_m,
         'moves_left': ml, 'draw_mask': dm,
+        'chain_version': CHAIN_VERSION,
     }
     torch.save(result, cache_path)
     return result
@@ -552,8 +574,11 @@ def _eval_minimax_worker(args):
 
 @torch.no_grad()
 def evaluate_vs_minimax(model, device, n_games: int = 100,
-                        n_sims: int = 200, minimax_time: float = 0.1) -> float:
-    """Play MCTSBot vs MinimaxBot with batched GPU eval across all games."""
+                        n_sims: int = 200, minimax_time: float = 0.1) -> dict:
+    """Play MCTSBot vs MinimaxBot with batched GPU eval across all games.
+
+    Returns dict with wins, losses, draws, and score (W=1, D=0.5, L=0).
+    """
     from mcts.tree import (
         create_trees_batched, select_leaf, expand_and_backprop,
         maybe_expand_leaf, select_move_pair, select_single_move,
@@ -740,10 +765,10 @@ def evaluate_vs_minimax(model, device, n_games: int = 100,
     proc_pool.join()
     pbar.close()
     total = max(wins + losses + draws, 1)
-    win_rate = (wins + 0.5 * draws) / total
-    print(f"  MCTSBot vs Minimax: {wins}W / {losses}L / {draws}D "
-          f"= {100 * win_rate:.1f}% win rate")
-    return win_rate
+    score = (wins + 0.5 * draws) / total
+    print(f"  MCTSBot vs Minimax({minimax_time:.3f}s): {wins}W / {losses}L / {draws}D "
+          f"= {100 * score:.1f}% score")
+    return {"wins": wins, "losses": losses, "draws": draws, "score": score}
 
 
 def _eval_result(game, mcts_player):
@@ -756,11 +781,116 @@ def _eval_result(game, mcts_player):
 
 
 # ---------------------------------------------------------------------------
+# Adaptive crossover time evaluation
+# ---------------------------------------------------------------------------
+
+def _estimate_crossover(log_times, scores, old_center_log):
+    """Estimate minimax time where MCTS score = 0.5 via log-space interpolation.
+
+    Args:
+        log_times: list of 3 log(time) values (ascending).
+        scores: list of 3 MCTS scores (should generally decrease as time rises).
+        old_center_log: log of previous center estimate (fallback).
+
+    Returns:
+        (crossover_log, extrapolated): log of estimated crossover time, and
+        whether the estimate required extrapolation beyond the bracket.
+    """
+    target = 0.5
+
+    # Try to find a bracket containing 0.5
+    for i in range(len(scores) - 1):
+        s_lo, s_hi = scores[i], scores[i + 1]
+        t_lo, t_hi = log_times[i], log_times[i + 1]
+        if (s_lo >= target >= s_hi) or (s_lo <= target <= s_hi):
+            if abs(s_hi - s_lo) < 1e-9:
+                return (t_lo + t_hi) / 2, False
+            frac = (target - s_lo) / (s_hi - s_lo)
+            return t_lo + frac * (t_hi - t_lo), False
+
+    # Not bracketed — extrapolate
+    if all(s > target for s in scores):
+        # All wins: minimax needs more time. Extrapolate rightward.
+        slope = (scores[-1] - scores[-2]) / (log_times[-1] - log_times[-2])
+        if abs(slope) < 1e-9:
+            return log_times[-1] + math.log(2), True
+        return log_times[-1] + (target - scores[-1]) / slope, True
+
+    if all(s < target for s in scores):
+        # All losses: minimax needs less time. Extrapolate leftward.
+        slope = (scores[1] - scores[0]) / (log_times[1] - log_times[0])
+        if abs(slope) < 1e-9:
+            return log_times[0] - math.log(2), True
+        return log_times[0] + (target - scores[0]) / slope, True
+
+    # Non-monotonic: fall back to old center
+    return old_center_log, False
+
+
+def evaluate_crossover(model, device, n_games=100, n_sims=200,
+                       center=0.1, momentum=0.3, max_time=1.0):
+    """Adaptive evaluation: find minimax time where MCTS scores 0.5.
+
+    Plays games at 3 log-spaced time limits around `center`, interpolates the
+    crossover point, and smooths with momentum. Actual play times are capped
+    at `max_time`; crossover estimates can exceed the cap via extrapolation.
+
+    Returns dict with crossover_time, scores at each bracket, etc.
+    """
+    # Build bracket in log-space
+    raw_times = [center * 0.5, center, center * 2.0]
+
+    # If bracket exceeds cap, anchor at the cap
+    if raw_times[-1] > max_time:
+        actual_times = [max_time * 0.25, max_time * 0.5, max_time]
+    else:
+        actual_times = raw_times
+
+    # Distribute games across 3 brackets
+    games_per = n_games // 3
+    games_last = n_games - 2 * games_per  # remainder to middle bracket
+
+    model.eval()
+    results = []
+    for i, t in enumerate(actual_times):
+        n = games_last if i == 1 else games_per
+        print(f"\n  Bracket {i+1}/3: minimax_time={t:.4f}s, {n} games")
+        r = evaluate_vs_minimax(model, device, n_games=n,
+                                n_sims=n_sims, minimax_time=t)
+        results.append(r)
+
+    scores = [r["score"] for r in results]
+    log_times = [math.log(t) for t in actual_times]
+    old_center_log = math.log(center)
+
+    raw_log, extrapolated = _estimate_crossover(log_times, scores, old_center_log)
+    raw_crossover = math.exp(raw_log)
+
+    # Momentum smoothing
+    smoothed_log = (1 - momentum) * raw_log + momentum * old_center_log
+    crossover_time = math.exp(smoothed_log)
+
+    print(f"\n  Crossover estimate: {crossover_time:.4f}s"
+          f" (raw={raw_crossover:.4f}s, center={center:.4f}s"
+          f"{', extrapolated' if extrapolated else ''})")
+
+    return {
+        "crossover_time": crossover_time,
+        "raw_crossover": raw_crossover,
+        "score_low": scores[0],
+        "score_mid": scores[1],
+        "score_high": scores[2],
+        "times": actual_times,
+        "extrapolated": extrapolated,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint management
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(model, optimizer, scaler, round_num, output_dir,
-                    best_win_rate=0.0):
+                    best_win_rate=0.0, crossover_time=None):
     """Save model checkpoint atomically."""
     os.makedirs(output_dir, exist_ok=True)
     ckpt = {
@@ -769,6 +899,7 @@ def save_checkpoint(model, optimizer, scaler, round_num, output_dir,
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict() if scaler else None,
         "best_win_rate": best_win_rate,
+        "crossover_time": crossover_time,
     }
     path = os.path.join(output_dir, f"round_{round_num}.pt")
     tmp = path + ".tmp"
@@ -806,8 +937,8 @@ def main():
                         help="Evaluation games per round")
     parser.add_argument("--eval-sims", type=int, default=200,
                         help="MCTS sims for evaluation bot")
-    parser.add_argument("--minimax-time", type=float, default=0.1,
-                        help="Time limit for minimax opponent")
+    parser.add_argument("--minimax-time", type=float, default=0.001,
+                        help="Initial center time for crossover estimation")
     parser.add_argument("--window", type=int, default=4,
                         help="Sliding window of rounds for training data")
     parser.add_argument("--decay", type=float, default=0.75,
@@ -875,6 +1006,7 @@ def main():
     # Resume
     start_round = 0
     best_win_rate = 0.0
+    crossover_time = None
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
@@ -886,6 +1018,7 @@ def main():
                 scaler.load_state_dict(ckpt["scaler_state_dict"])
             start_round = ckpt.get("round", 0) + 1
             best_win_rate = ckpt.get("best_win_rate", 0.0)
+            crossover_time = ckpt.get("crossover_time", None)
             print(f"Resumed from {args.resume} (round {start_round})")
         else:
             print(f"Loaded model weights from {args.resume} (fresh optimizer)")
@@ -899,6 +1032,7 @@ def main():
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         start_round = ckpt.get("round", 0) + 1
         best_win_rate = ckpt.get("best_win_rate", 0.0)
+        crossover_time = ckpt.get("crossover_time", None)
         print(f"Auto-resumed from {ckpt_path} (round {start_round})")
 
     # wandb
@@ -936,19 +1070,28 @@ def main():
 
     # Run evaluation immediately if requested
     if args.evaluate:
-        print(f"\n--- Startup evaluation: {args.eval_games} games vs Minimax ---")
+        center = crossover_time if crossover_time is not None else args.minimax_time
+        print(f"\n--- Startup evaluation: {args.eval_games} games, "
+              f"center={center:.4f}s ---")
         model.eval()
-        win_rate = evaluate_vs_minimax(
+        eval_result = evaluate_crossover(
             model, device, n_games=args.eval_games,
-            n_sims=args.eval_sims,
-            minimax_time=args.minimax_time,
+            n_sims=args.eval_sims, center=center,
         )
+        crossover_time = eval_result["crossover_time"]
+        win_rate = eval_result["score_mid"]
         if win_rate > best_win_rate:
             best_win_rate = win_rate
-            print(f"  New best win rate: {100 * best_win_rate:.1f}%")
+            print(f"  New best win rate at mid time: {100 * best_win_rate:.1f}%")
         if use_wandb:
-            wandb.log({"eval/win_rate": win_rate,
-                        "round": start_round - 1}, commit=True)
+            wandb.log({
+                "eval/crossover_time": crossover_time,
+                "eval/score_low": eval_result["score_low"],
+                "eval/score_mid": eval_result["score_mid"],
+                "eval/score_high": eval_result["score_high"],
+                "eval/win_rate": win_rate,
+                "round": start_round - 1,
+            }, commit=True)
 
     for round_num in range(start_round, start_round + args.rounds):
         print(f"\n{'='*60}")
@@ -1034,24 +1177,29 @@ def main():
 
         # --- 3. Checkpoint ---
         ckpt_path = save_checkpoint(model, optimizer, scaler, round_num,
-                                    args.output_dir, best_win_rate)
+                                    args.output_dir, best_win_rate,
+                                    crossover_time=crossover_time)
 
         # --- 4. Evaluate (every eval_every rounds) ---
+        eval_result = None
         win_rate = None
         t_eval = 0.0
         if (round_num + 1) % args.eval_every == 0:
-            print(f"\n--- Evaluation: {args.eval_games} games vs Minimax ---")
+            center = crossover_time if crossover_time is not None else args.minimax_time
+            print(f"\n--- Evaluation: {args.eval_games} games, "
+                  f"center={center:.4f}s ---")
             t2 = time.time()
-            win_rate = evaluate_vs_minimax(
+            eval_result = evaluate_crossover(
                 model, device, n_games=args.eval_games,
-                n_sims=args.eval_sims,
-                minimax_time=args.minimax_time,
+                n_sims=args.eval_sims, center=center,
             )
             t_eval = time.time() - t2
+            crossover_time = eval_result["crossover_time"]
+            win_rate = eval_result["score_mid"]
 
             if win_rate > best_win_rate:
                 best_win_rate = win_rate
-                print(f"  New best win rate: {100 * best_win_rate:.1f}%")
+                print(f"  New best win rate at mid time: {100 * best_win_rate:.1f}%")
 
         t_total = time.time() - t0
 
@@ -1060,8 +1208,11 @@ def main():
         print(f"    Examples: {len(examples):,}")
         print(f"    Draw rate: {100 * draw_rate:.1f}%")
         print(f"    Loss: {avg_loss:.4f}")
-        if win_rate is not None:
-            print(f"    Win rate: {100 * win_rate:.1f}%")
+        if eval_result is not None:
+            print(f"    Crossover time: {crossover_time:.4f}s")
+            print(f"    Scores: low={eval_result['score_low']:.2f} "
+                  f"mid={eval_result['score_mid']:.2f} "
+                  f"high={eval_result['score_high']:.2f}")
         print(f"    Time: {t_gen:.0f}s gen + {t_train:.0f}s train "
               f"+ {t_eval:.0f}s eval = {t_total:.0f}s total")
 
@@ -1080,12 +1231,19 @@ def main():
                 "time_train": t_train,
                 "time_eval": t_eval,
             }
-            if win_rate is not None:
-                log_data["win_rate"] = win_rate
+            if eval_result is not None:
+                log_data["eval/crossover_time"] = crossover_time
+                log_data["eval/score_low"] = eval_result["score_low"]
+                log_data["eval/score_mid"] = eval_result["score_mid"]
+                log_data["eval/score_high"] = eval_result["score_high"]
+                log_data["eval/win_rate"] = win_rate
             wandb.log(log_data)
 
     print(f"\n{'='*60}")
-    print(f"  Training complete. Best win rate: {100 * best_win_rate:.1f}%")
+    if crossover_time is not None:
+        print(f"  Training complete. Crossover time: {crossover_time:.4f}s")
+    else:
+        print(f"  Training complete. Best win rate: {100 * best_win_rate:.1f}%")
     print(f"{'='*60}")
 
     if use_wandb:

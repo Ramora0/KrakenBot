@@ -99,10 +99,11 @@ class HexResNet(nn.Module):
         self.ml_fc1 = nn.Linear(v_channels * 2, 256)
         self.ml_fc2 = nn.Linear(256, 1)
 
-        # Chain head: per-cell longest unblocked chain for each player
-        # trunk → 1x1 conv → ReLU → 1x1 conv → 2 channels
+        # Chain head: per-cell per-direction unblocked chain for each player
+        # trunk → 1x1 conv → ReLU → 1x1 conv → 6 channels
+        # [cur_d0, cur_d1, cur_d2, opp_d0, opp_d1, opp_d2]
         self.chain_conv1 = nn.Conv2d(num_filters, chain_channels, 1)
-        self.chain_conv2 = nn.Conv2d(chain_channels, 2, 1)
+        self.chain_conv2 = nn.Conv2d(chain_channels, 6, 1)
 
         # Pair policy head
         self.pair_head = PairPolicyHead(num_filters, pair_head_dim)
@@ -118,7 +119,7 @@ class HexResNet(nn.Module):
             value: [B] scalar in [-1, 1]
             pair_logits: [B, N, N] raw pair logits (diagonal=-inf, padding=-inf)
             moves_left: [B] predicted remaining moves (>= 0)
-            chain: [B, 2, H, W] per-cell longest unblocked chain length
+            chain: [B, 6, H, W] per-cell per-direction unblocked chain length
         """
         s = F.relu(self.stem_gn(self.stem_conv(x)))
         t = self.blocks(s)
@@ -142,8 +143,8 @@ class HexResNet(nn.Module):
         # Pair policy head
         pair_logits = self.pair_head(t, mask)
 
-        # Chain head: per-cell longest unblocked chain for current/opponent
-        chain = self.chain_conv2(F.relu(self.chain_conv1(t)))  # [B, 2, H, W]
+        # Chain head: per-cell per-direction chain for current/opponent
+        chain = self.chain_conv2(F.relu(self.chain_conv1(t)))  # [B, 6, H, W]
 
         return value, pair_logits, moves_left, chain
 
@@ -252,6 +253,6 @@ if __name__ == "__main__":
         assert torch.allclose(pair, pair.transpose(1, 2)), "Not symmetric!"
         assert (pair[:, range(N), range(N)] == float("-inf")).all(), "Diagonal not masked!"
         assert ml.shape == (4,), f"moves_left shape wrong: {ml.shape}"
-        assert chain.shape == (4, 2, size, size), f"chain shape wrong: {chain.shape}"
+        assert chain.shape == (4, 6, size, size), f"chain shape wrong: {chain.shape}"
         assert (ml >= 0).all(), "moves_left should be non-negative"
     print("All checks passed.")

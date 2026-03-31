@@ -2,11 +2,14 @@
 
 Trains a multi-head ResNet: value (win rate) + pair policy (attention over cell
 embeddings producing N×N pair logits) + moves-left + chain (auxiliary heads).
-Only double-move examples are used for policy training (single-move mid-turn
-examples are filtered out).
+
+For positions with known winning moves the policy loss pushes all probability
+mass onto the set of winning pairs (any pair containing a winning single, or
+any explicitly listed winning pair) without caring about the distribution
+within that set.  Non-winning positions use standard pair cross-entropy.
 
 Usage:
-  python -m training.distill.train_resnet --epochs 5 --batch-size 512 --amp --wandb
+  python -m training.distill.train_resnet --epochs 5 --batch-size 256 --amp
 """
 
 import argparse
@@ -32,7 +35,10 @@ except ImportError:
 from game import HEX_DIRECTIONS
 from model.resnet import BOARD_SIZE, HexResNet
 
-CACHE_VERSION = "v2"  # bumped: now includes moves_left
+CACHE_VERSION = "v3"  # bumped: winning_singles + winning_pairs, all double-move
+
+MAX_WIN_SINGLES = 10  # max winning single cells per example
+MAX_WIN_PAIRS = 10    # max winning cell pairs per example
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +46,7 @@ CACHE_VERSION = "v2"  # bumped: now includes moves_left
 # ---------------------------------------------------------------------------
 
 def _precompute_chain_tables(N=BOARD_SIZE, win_len=6):
-    """Precompute window cell indices and per-cell window membership."""
+    """Precompute window cell indices and per-direction cell membership."""
     n_windows = N * N * 3  # 3 hex directions
     win_qs = np.zeros((n_windows, win_len), dtype=np.int64)
     win_rs = np.zeros((n_windows, win_len), dtype=np.int64)
@@ -54,24 +60,31 @@ def _precompute_chain_tables(N=BOARD_SIZE, win_len=6):
                     win_rs[w_idx, i] = (sr + i * dr) % N
                 w_idx += 1
 
-    membership = [[] for _ in range(N * N)]
-    for w in range(n_windows):
-        for i in range(win_len):
-            flat = win_qs[w, i] * N + win_rs[w, i]
-            membership[flat].append(w)
+    # Per-direction cell-to-windows membership
+    n_per_dir = N * N
+    cw_per_dir = []
+    cm_per_dir = []
+    for d in range(3):
+        start = d * n_per_dir
+        end = start + n_per_dir
+        membership = [[] for _ in range(N * N)]
+        for w in range(start, end):
+            for i in range(win_len):
+                flat = win_qs[w, i] * N + win_rs[w, i]
+                membership[flat].append(w)
+        max_per = max(len(m) for m in membership)
+        cw = np.zeros((N * N, max_per), dtype=np.int64)
+        cm = np.zeros((N * N, max_per), dtype=np.bool_)
+        for idx, m in enumerate(membership):
+            cw[idx, :len(m)] = m
+            cm[idx, :len(m)] = True
+        cw_per_dir.append(torch.from_numpy(cw))
+        cm_per_dir.append(torch.from_numpy(cm))
 
-    max_per_cell = max(len(m) for m in membership)
-    cell_windows = np.zeros((N * N, max_per_cell), dtype=np.int64)
-    cell_mask = np.zeros((N * N, max_per_cell), dtype=np.bool_)
-    for idx, m in enumerate(membership):
-        cell_windows[idx, :len(m)] = m
-        cell_mask[idx, :len(m)] = True
-
-    return (torch.from_numpy(win_qs), torch.from_numpy(win_rs),
-            torch.from_numpy(cell_windows), torch.from_numpy(cell_mask))
+    return torch.from_numpy(win_qs), torch.from_numpy(win_rs), cw_per_dir, cm_per_dir
 
 
-_WIN_QS, _WIN_RS, _CELL_WINDOWS, _CELL_MASK = _precompute_chain_tables()
+_WIN_QS, _WIN_RS, _CW_PER_DIR, _CM_PER_DIR = _precompute_chain_tables()
 _chain_tables_cache: dict = {}
 
 
@@ -80,22 +93,23 @@ def _get_chain_tables(device):
     if device not in _chain_tables_cache:
         _chain_tables_cache[device] = (
             _WIN_QS.to(device), _WIN_RS.to(device),
-            _CELL_WINDOWS.to(device), _CELL_MASK.to(device),
+            [cw.to(device) for cw in _CW_PER_DIR],
+            [cm.to(device) for cm in _CM_PER_DIR],
         )
     return _chain_tables_cache[device]
 
 
 def compute_chain_targets_batch(planes):
-    """Compute chain targets from planes tensor (vectorized, any device).
+    """Compute per-direction chain targets from planes tensor.
 
     Args:
         planes: [B, 2, N, N] float tensor (0/1 values)
     Returns:
-        targets: [B, 2, N, N] float — max unblocked chain per cell per player
-        mask: [B, 2, N, N] float — 0 on cells occupied by the other player
+        targets: [B, 6, N, N] float — per-dir unblocked chain per cell per player
+        mask: [B, 6, N, N] float — 0 on cells occupied by the other player
     """
     device = planes.device
-    wq, wr, cw, cm = _get_chain_tables(device)
+    wq, wr, cw_list, cm_list = _get_chain_tables(device)
     B, _, N, _ = planes.shape
 
     cur = planes[:, 0]  # [B, N, N]
@@ -104,19 +118,22 @@ def compute_chain_targets_batch(planes):
     cur_in = cur[:, wq, wr]  # [B, n_windows, 6]
     opp_in = opp[:, wq, wr]
 
-    targets = planes.new_zeros(B, 2, N, N)
-    cm_float = cm.unsqueeze(0).float()  # [1, N*N, max_per_cell]
+    targets = planes.new_zeros(B, 6, N, N)
 
-    for ch, (p_in, b_in) in enumerate([(cur_in, opp_in), (opp_in, cur_in)]):
+    for ch_base, (p_in, b_in) in enumerate([(cur_in, opp_in), (opp_in, cur_in)]):
         counts = p_in.sum(dim=2)               # [B, n_windows]
         blocked = b_in.sum(dim=2) > 0          # [B, n_windows]
         unblocked = counts * (~blocked).float()
-        vals = unblocked[:, cw] * cm_float     # [B, N*N, max_per_cell]
-        targets[:, ch] = vals.max(dim=2).values.reshape(B, N, N)
 
-    mask = planes.new_ones(B, 2, N, N)
-    mask[:, 0] = 1 - opp   # mask current-player channel on opponent cells
-    mask[:, 1] = 1 - cur   # mask opponent channel on current-player cells
+        for d in range(3):
+            cw = cw_list[d]
+            cm_float = cm_list[d].unsqueeze(0).float()
+            vals = unblocked[:, cw] * cm_float
+            targets[:, ch_base * 3 + d] = vals.max(dim=2).values.reshape(B, N, N)
+
+    mask = planes.new_ones(B, 6, N, N)
+    mask[:, 0:3] = (1 - opp).unsqueeze(1).expand(B, 3, N, N)
+    mask[:, 3:6] = (1 - cur).unsqueeze(1).expand(B, 3, N, N)
 
     return targets, mask
 
@@ -153,12 +170,26 @@ def preprocess_to_cache(parquet_path, cache_dir):
         os.path.join(cache_dir, "moves_left.npy"), mode="w+",
         dtype=np.int16, shape=(n,),
     )
+    ws_mm = np.lib.format.open_memmap(
+        os.path.join(cache_dir, "winning_singles.npy"), mode="w+",
+        dtype=np.int16, shape=(n, MAX_WIN_SINGLES),
+    )
+    ws_mm[:] = -1
+    wp_mm = np.lib.format.open_memmap(
+        os.path.join(cache_dir, "winning_pairs.npy"), mode="w+",
+        dtype=np.int16, shape=(n, MAX_WIN_PAIRS, 2),
+    )
+    wp_mm[:] = -1
 
     boards = df["board"].values
     cps = df["current_player"].values
     moves_col = df["moves"].values
     win_col = df["win_score"].values
     gid_col = df["game_id"].values
+    has_winning = "winning_singles" in df.columns
+    if has_winning:
+        ws_col = df["winning_singles"].values
+        wp_col = df["winning_pairs"].values
     del df
 
     # Track stone counts for moves_left computation
@@ -204,6 +235,24 @@ def preprocess_to_cache(parquet_path, cache_dir):
         stone_counts[i] = len(board_dict)
         total_after[i] = len(board_dict) + len(move_indices)
 
+        # Parse winning moves (apply same centering offset)
+        if has_winning:
+            for k, (sq, sr) in enumerate(json.loads(ws_col[i])):
+                if k >= MAX_WIN_SINGLES:
+                    break
+                gq, gr = int(sq) + off_q, int(sr) + off_r
+                if 0 <= gq < bs and 0 <= gr < bs:
+                    ws_mm[i, k] = gq * bs + gr
+            for k, pair in enumerate(json.loads(wp_col[i])):
+                if k >= MAX_WIN_PAIRS:
+                    break
+                gq1, gr1 = int(pair[0][0]) + off_q, int(pair[0][1]) + off_r
+                gq2, gr2 = int(pair[1][0]) + off_q, int(pair[1][1]) + off_r
+                if (0 <= gq1 < bs and 0 <= gr1 < bs and
+                        0 <= gq2 < bs and 0 <= gr2 < bs):
+                    wp_mm[i, k, 0] = gq1 * bs + gr1
+                    wp_mm[i, k, 1] = gq2 * bs + gr2
+
     # Compute moves_left: game_total_stones - current_stone_count
     gids_arr = np.array(gids_mm[:])
     max_gid = int(gids_arr.max())
@@ -211,23 +260,24 @@ def preprocess_to_cache(parquet_path, cache_dir):
     np.maximum.at(game_totals, gids_arr, total_after)
     moves_left_mm[:] = game_totals[gids_arr] - stone_counts
 
-    for mm in (planes_mm, moves_mm, wins_mm, gids_mm, moves_left_mm):
+    for mm in (planes_mm, moves_mm, wins_mm, gids_mm, moves_left_mm,
+               ws_mm, wp_mm):
         mm.flush()
 
     with open(os.path.join(cache_dir, "DONE"), "w") as f:
         f.write(f"{CACHE_VERSION}:{n}")
 
     size_mb = (planes_mm.nbytes + moves_mm.nbytes + wins_mm.nbytes
-               + moves_left_mm.nbytes) / 1e6
+               + moves_left_mm.nbytes + ws_mm.nbytes + wp_mm.nbytes) / 1e6
     print(f"  Cache written: {size_mb:.0f} MB")
 
 
 # ---------------------------------------------------------------------------
-# Loading: cache → CPU tensors, filtered to double-move only for pair policy
+# Loading: cache → CPU tensors, split by game_id
 # ---------------------------------------------------------------------------
 
 def load_data(parquet_path, cache_dir, val_fraction=0.2, seed=42):
-    """Load cache, filter to double-move examples, split by game_id."""
+    """Load cache and split by game_id."""
     done_path = os.path.join(cache_dir, "DONE")
     need_reprocess = True
     if os.path.exists(done_path):
@@ -243,35 +293,30 @@ def load_data(parquet_path, cache_dir, val_fraction=0.2, seed=42):
         preprocess_to_cache(parquet_path, cache_dir)
 
     print("Loading cache...")
-    moves_mm = np.load(os.path.join(cache_dir, "moves.npy"), mmap_mode="r")
     gids_mm = np.load(os.path.join(cache_dir, "game_ids.npy"), mmap_mode="r")
-    n_total = len(moves_mm)
+    n_total = len(gids_mm)
 
-    # Filter to double-move examples only (m2 >= 0)
-    has_pair = moves_mm[:, 1] >= 0
-    pair_idx = np.where(has_pair)[0]
-    print(f"  {n_total:,} total rows, {len(pair_idx):,} double-move "
-          f"({100*len(pair_idx)/n_total:.0f}%)")
-
-    # Split by game_id (on filtered set)
-    gids_filtered = np.array(gids_mm[pair_idx])
-    unique_gids = sorted(set(gids_filtered.tolist()))
+    # Split by game_id
+    gids_arr = np.array(gids_mm[:])
+    unique_gids = sorted(set(gids_arr.tolist()))
     rng = random.Random(seed)
     rng.shuffle(unique_gids)
     n_val_games = max(1, int(len(unique_gids) * val_fraction))
     val_set = set(unique_gids[:n_val_games])
 
-    val_mask = np.isin(gids_filtered, list(val_set))
-    train_sub = pair_idx[~val_mask]
-    val_sub = pair_idx[val_mask]
-    del gids_filtered, gids_mm
-    print(f"  Split: {len(train_sub):,} train / {len(val_sub):,} val "
+    val_mask = np.isin(gids_arr, list(val_set))
+    train_sub = np.where(~val_mask)[0]
+    val_sub = np.where(val_mask)[0]
+    del gids_arr, gids_mm
+    print(f"  {n_total:,} rows, {len(train_sub):,} train / {len(val_sub):,} val "
           f"({len(unique_gids) - n_val_games} / {n_val_games} games)")
 
-    # Load data
     planes_mm = np.load(os.path.join(cache_dir, "planes.npy"), mmap_mode="r")
+    moves_mm = np.load(os.path.join(cache_dir, "moves.npy"), mmap_mode="r")
     wins_mm = np.load(os.path.join(cache_dir, "wins.npy"), mmap_mode="r")
     ml_mm = np.load(os.path.join(cache_dir, "moves_left.npy"), mmap_mode="r")
+    ws_mm = np.load(os.path.join(cache_dir, "winning_singles.npy"), mmap_mode="r")
+    wp_mm = np.load(os.path.join(cache_dir, "winning_pairs.npy"), mmap_mode="r")
 
     def make_dataset(idx):
         idx = np.sort(idx)
@@ -279,15 +324,20 @@ def load_data(parquet_path, cache_dir, val_fraction=0.2, seed=42):
         m = torch.from_numpy(np.array(moves_mm[idx], dtype=np.int64))
         w = torch.from_numpy(np.array(wins_mm[idx], dtype=np.float32))
         ml = torch.from_numpy(np.array(ml_mm[idx], dtype=np.float32))
-        return TensorDataset(p, m, w, ml)
+        ws = torch.from_numpy(np.array(ws_mm[idx], dtype=np.int64))
+        wp = torch.from_numpy(np.array(wp_mm[idx], dtype=np.int64))
+        return TensorDataset(p, m, w, ml, ws, wp)
 
     print("  Loading train split...")
     train_ds = make_dataset(train_sub)
     print("  Loading val split...")
     val_ds = make_dataset(val_sub)
 
+    n_win = int((ws_mm[train_sub, 0] >= 0).sum() +
+                (wp_mm[train_sub, 0, 0] >= 0).sum())
     train_gb = sum(t.nbytes for t in train_ds.tensors) / 1e9
     val_gb = sum(t.nbytes for t in val_ds.tensors) / 1e9
+    print(f"  Examples with winning moves: ~{n_win:,}")
     print(f"  CPU RAM: {train_gb:.1f} GB train + {val_gb:.1f} GB val")
 
     return train_ds, val_ds
@@ -297,19 +347,76 @@ def load_data(parquet_path, cache_dir, val_fraction=0.2, seed=42):
 # Loss
 # ---------------------------------------------------------------------------
 
+def _winning_policy_loss(pair_logits, w_singles, w_pairs):
+    """Compute -log P(any winning pair) for examples with winning moves.
+
+    Builds a mask of all winning pairs (any pair containing a winning single,
+    plus explicitly listed winning pairs), then returns
+    logsumexp(all) - logsumexp(winning)  per example.
+
+    Only materializes the [Bw, NC, NC] mask for the subset of examples that
+    actually have winning moves, keeping memory small.
+
+    Returns [B] loss (0 for examples without winning moves).
+    """
+    B, NC, _ = pair_logits.shape
+    device = pair_logits.device
+
+    has_win = (w_singles[:, 0] >= 0) | (w_pairs[:, 0, 0] >= 0)
+    loss = torch.zeros(B, device=device)
+    win_idx = has_win.nonzero(as_tuple=True)[0]
+    if len(win_idx) == 0:
+        return loss, has_win
+
+    Bw = len(win_idx)
+    wl = pair_logits[win_idx]             # [Bw, NC, NC]
+    ws = w_singles[win_idx]               # [Bw, max_s]
+    wp = w_pairs[win_idx]                 # [Bw, max_p, 2]
+
+    # Cell mask: 1 for winning single cells
+    cell_mask = torch.zeros(Bw, NC, device=device, dtype=torch.bool)
+    for k in range(ws.shape[1]):
+        valid = ws[:, k] >= 0
+        if not valid.any():
+            break
+        cell_mask[valid, ws[valid, k]] = True
+
+    # Pair mask: (i,j) wins if cell_mask[i] or cell_mask[j]
+    pair_mask = cell_mask.unsqueeze(2) | cell_mask.unsqueeze(1)  # [Bw, NC, NC]
+
+    # Add explicit winning pairs
+    for k in range(wp.shape[1]):
+        valid = wp[:, k, 0] >= 0
+        if not valid.any():
+            break
+        v = valid.nonzero(as_tuple=True)[0]
+        a, b = wp[v, k, 0], wp[v, k, 1]
+        pair_mask[v, a, b] = True
+        pair_mask[v, b, a] = True
+
+    # loss = log Z - log(sum over winning pairs)
+    masked = wl.masked_fill(~pair_mask, float('-inf'))
+    log_Z = wl.reshape(Bw, -1).logsumexp(dim=-1)
+    log_win = masked.reshape(Bw, -1).logsumexp(dim=-1)
+
+    loss[win_idx] = log_Z - log_win
+    return loss, has_win
+
+
 def compute_loss(value_pred, pair_logits, ml_pred, chain_pred,
                  wins, moves, ml_target, chain_target, chain_mask,
+                 w_singles, w_pairs,
                  value_weight=1.0, policy_weight=1.0, entropy_weight=0.01,
                  ml_weight=0.1, chain_weight=0.1):
     """Pair policy CE + value MSE + entropy + moves-left MSE + chain MSE.
 
+    For examples with winning moves, the policy loss is replaced by
+    -log P(winning pair) which pushes all mass onto the winning set.
+
     pair_logits: [B, N, N] — symmetrized pair scores
-    moves: [B, 2] — (m1, m2) flat cell indices, both guaranteed >= 0
-    ml_pred: [B] — predicted moves left (non-negative)
-    ml_target: [B] — ground truth moves left
-    chain_pred: [B, 2, H, W] — predicted chain lengths
-    chain_target: [B, 2, H, W] — ground truth chain lengths
-    chain_mask: [B, 2, H, W] — loss mask
+    moves: [B, 2] — (m1, m2) flat cell indices
+    w_singles: [B, max_s] int — winning single-cell indices, -1 padded
+    w_pairs: [B, max_p, 2] int — winning pair indices, -1 padded
     """
     B, N, _ = pair_logits.shape
     m1 = moves[:, 0]
@@ -317,12 +424,16 @@ def compute_loss(value_pred, pair_logits, ml_pred, chain_pred,
 
     value_loss = F.mse_loss(value_pred, wins)
 
-    # Pair CE: target is flat index m1*N + m2
+    # Policy: CE for normal examples, winning-set loss for finishing examples
     flat_logits = pair_logits.reshape(B, -1)  # [B, N²]
     pair_target = m1 * N + m2
-    policy_loss = F.cross_entropy(flat_logits, pair_target)
+    ce_loss = F.cross_entropy(flat_logits, pair_target, reduction='none')  # [B]
 
-    # Entropy regularization
+    win_loss, has_win = _winning_policy_loss(pair_logits, w_singles, w_pairs)
+    policy_per = torch.where(has_win, win_loss, ce_loss)
+    policy_loss = policy_per.mean()
+
+    # Entropy regularization (only on non-winning examples)
     if entropy_weight > 0:
         probs = F.softmax(flat_logits.float(), dim=-1)
         entropy = -(probs * probs.clamp(min=1e-10).log()).sum(dim=-1).mean()
@@ -354,24 +465,12 @@ def compute_loss(value_pred, pair_logits, ml_pred, chain_pred,
 # Finishing evaluation
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def _find_finishing_positions(planes, wins, device, batch_size=1024):
-    """Find val indices where current player has unblocked chain >= N and won.
-
-    Returns {min_chain: index_tensor} for min_chain in [4, 5].
-    """
-    n = len(planes)
-    max_chains = torch.zeros(n)
-    for i in range(0, n, batch_size):
-        j = min(i + batch_size, n)
-        ct, _ = compute_chain_targets_batch(planes[i:j].to(device))
-        max_chains[i:j] = ct[:, 0].reshape(j - i, -1).max(dim=1).values.cpu()
-
-    win_mask = wins > 0
-    return {
-        mc: (win_mask & (max_chains >= mc)).nonzero(as_tuple=True)[0]
-        for mc in [4, 5]
-    }
+def _find_finishing_indices(w_singles, w_pairs, wins):
+    """Return indices of val examples that have winning moves and win_score > 0."""
+    has_singles = w_singles[:, 0] >= 0
+    has_pairs = w_pairs[:, 0, 0] >= 0
+    has_win = has_singles | has_pairs
+    return (has_win & (wins > 0)).nonzero(as_tuple=True)[0]
 
 
 @torch.no_grad()
@@ -379,54 +478,48 @@ def evaluate_finishing(model, device, planes, moves, finish_indices,
                        batch_size=512):
     """Check if model's top pair prediction completes 6-in-a-row.
 
-    Also checks the ground-truth (minimax) pair as a reference.
-    Returns {min_chain: (model_rate, gt_rate, n_positions)}.
+    Returns (model_rate, gt_rate, n_positions).
     """
     N = BOARD_SIZE
     NC = N * N
     wq, wr = _get_chain_tables(torch.device('cpu'))[:2]
 
-    results = {}
-    for min_chain, indices in sorted(finish_indices.items()):
-        total = len(indices)
-        if total == 0:
-            results[min_chain] = (0.0, 0.0, 0)
-            continue
+    total = len(finish_indices)
+    if total == 0:
+        return 0.0, 0.0, 0
 
-        model_wins = 0
-        gt_wins = 0
+    model_wins = 0
+    gt_wins = 0
 
-        for i in range(0, total, batch_size):
-            j = min(i + batch_size, total)
-            idx = indices[i:j]
-            B = len(idx)
-            b_range = torch.arange(B)
+    for i in range(0, total, batch_size):
+        j = min(i + batch_size, total)
+        idx = finish_indices[i:j]
+        B = len(idx)
+        b_range = torch.arange(B)
 
-            batch = planes[idx].to(device)
-            _, pair_logits, _, _ = model(batch)
+        batch = planes[idx].to(device)
+        _, pair_logits, _, _ = model(batch)
 
-            top = pair_logits.reshape(B, -1).argmax(dim=-1).cpu()
-            pred_s1, pred_s2 = top // NC, top % NC
+        top = pair_logits.reshape(B, -1).argmax(dim=-1).cpu()
+        pred_s1, pred_s2 = top // NC, top % NC
 
-            gt_pair = moves[idx]
-            gt_s1, gt_s2 = gt_pair[:, 0], gt_pair[:, 1]
+        gt = moves[idx]
+        gt_s1, gt_s2 = gt[:, 0], gt[:, 1]
 
-            base = planes[idx, 0]  # [B, H, W]
+        base = planes[idx, 0]
 
-            for s1, s2, label in [(pred_s1, pred_s2, 'model'),
-                                   (gt_s1, gt_s2, 'gt')]:
-                board = base.clone()
-                board[b_range, s1 // N, s1 % N] = 1
-                board[b_range, s2 // N, s2 % N] = 1
-                won = (board[:, wq, wr].sum(dim=2) >= 6).any(dim=1).sum().item()
-                if label == 'model':
-                    model_wins += won
-                else:
-                    gt_wins += won
+        for s1, s2, label in [(pred_s1, pred_s2, 'model'),
+                               (gt_s1, gt_s2, 'gt')]:
+            board = base.clone()
+            board[b_range, s1 // N, s1 % N] = 1
+            board[b_range, s2 // N, s2 % N] = 1
+            won = (board[:, wq, wr].sum(dim=2) >= 6).any(dim=1).sum().item()
+            if label == 'model':
+                model_wins += won
+            else:
+                gt_wins += won
 
-        results[min_chain] = (model_wins / total, gt_wins / total, total)
-
-    return results
+    return model_wins / total, gt_wins / total, total
 
 
 # ---------------------------------------------------------------------------
@@ -446,17 +539,18 @@ def train(args):
         val_ds = torch.utils.data.Subset(val_ds, range(min(n, len(val_ds))))
         print(f"  Overfit mode: {len(train_ds)} train / {len(val_ds)} val")
 
-    # Precompute finishing eval positions from val set
+    # Extract val tensors for finishing eval
     if hasattr(val_ds, 'tensors'):
-        _vp, _vm, _vw = val_ds.tensors[0], val_ds.tensors[1], val_ds.tensors[2]
+        _vp, _vm, _vw, _, _vws, _vwp = val_ds.tensors
     else:
         _si = list(val_ds.indices)
         _vp = val_ds.dataset.tensors[0][_si]
         _vm = val_ds.dataset.tensors[1][_si]
         _vw = val_ds.dataset.tensors[2][_si]
-    finish_idx = _find_finishing_positions(_vp, _vw, device)
-    for mc, idx in sorted(finish_idx.items()):
-        print(f"  Finishing eval: {len(idx):,} val positions with chain>={mc}")
+        _vws = val_ds.dataset.tensors[4][_si]
+        _vwp = val_ds.dataset.tensors[5][_si]
+    finish_idx = _find_finishing_indices(_vws, _vwp, _vw)
+    print(f"  Finishing eval: {len(finish_idx):,} val positions with winning moves")
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -505,7 +599,7 @@ def train(args):
     resume_path = args.resume or (ckpt_path if os.path.exists(ckpt_path) else None)
     if resume_path:
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if scaler and ckpt.get("scaler_state_dict"):
             scaler.load_state_dict(ckpt["scaler_state_dict"])
@@ -542,11 +636,13 @@ def train(args):
         n_seen = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        for planes, moves, wins, ml_target in pbar:
+        for planes, moves, wins, ml_target, w_singles, w_pairs in pbar:
             planes = planes.to(device, non_blocking=True)
             moves = moves.to(device, non_blocking=True)
             wins = wins.to(device, non_blocking=True)
             ml_target = ml_target.to(device, non_blocking=True)
+            w_singles = w_singles.to(device, non_blocking=True)
+            w_pairs = w_pairs.to(device, non_blocking=True)
 
             # Compute chain targets on-the-fly from board planes
             with torch.no_grad():
@@ -560,6 +656,7 @@ def train(args):
                     loss, v_loss, p_loss, ent, ml_loss, ch_loss = compute_loss(
                         v_pred, pair_logits, ml_pred, chain_pred,
                         wins, moves, ml_target, chain_target, chain_mask,
+                        w_singles, w_pairs,
                         args.value_weight, args.policy_weight,
                         args.entropy_weight, args.ml_weight, args.chain_weight,
                     )
@@ -573,6 +670,7 @@ def train(args):
                 loss, v_loss, p_loss, ent, ml_loss, ch_loss = compute_loss(
                     v_pred, pair_logits, ml_pred, chain_pred,
                     wins, moves, ml_target, chain_target, chain_mask,
+                    w_singles, w_pairs,
                     args.value_weight, args.policy_weight,
                     args.entropy_weight, args.ml_weight, args.chain_weight,
                 )
@@ -675,11 +773,13 @@ def train(args):
         ml_abs_err = 0.0
 
         with torch.no_grad():
-            for planes, moves, wins, ml_target in val_loader:
+            for planes, moves, wins, ml_target, w_singles, w_pairs in val_loader:
                 planes = planes.to(device, non_blocking=True)
                 moves = moves.to(device, non_blocking=True)
                 wins = wins.to(device, non_blocking=True)
                 ml_target = ml_target.to(device, non_blocking=True)
+                w_singles = w_singles.to(device, non_blocking=True)
+                w_pairs = w_pairs.to(device, non_blocking=True)
 
                 chain_target, chain_mask = compute_chain_targets_batch(planes)
 
@@ -687,6 +787,7 @@ def train(args):
                 _, vl, pl, _, mll, chl = compute_loss(
                     v_pred, pair_logits, ml_pred, chain_pred,
                     wins, moves, ml_target, chain_target, chain_mask,
+                    w_singles, w_pairs,
                     args.value_weight, args.policy_weight,
                     0.0, args.ml_weight, args.chain_weight,
                 )
@@ -729,11 +830,9 @@ def train(args):
         )
 
         # Finishing eval
-        finish = evaluate_finishing(model, device, _vp, _vm, finish_idx)
-        parts = []
-        for mc, (mr, gr, n) in sorted(finish.items()):
-            parts.append(f"c>={mc}: model={mr:.1%} gt={gr:.1%} (n={n:,})")
-        print(f"  finish: {' | '.join(parts)}")
+        f_model, f_gt, f_n = evaluate_finishing(
+            model, device, _vp, _vm, finish_idx)
+        print(f"  finish: model={f_model:.1%} gt={f_gt:.1%} (n={f_n:,})")
 
         if use_wandb:
             wandb.log({
@@ -752,10 +851,8 @@ def train(args):
                 "val/pair_acc": pair_correct / n_val,
                 "val/either_cell_acc": either_correct / n_val,
                 "val/ml_mae": ml_abs_err / n_val,
-                **{f"val/finish_model_c{mc}": mr
-                   for mc, (mr, _, _) in finish.items()},
-                **{f"val/finish_gt_c{mc}": gr
-                   for mc, (_, gr, _) in finish.items()},
+                "val/finish_model": f_model,
+                "val/finish_gt": f_gt,
             }, step=global_step)
 
         # Checkpoint

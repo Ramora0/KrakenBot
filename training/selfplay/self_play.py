@@ -543,8 +543,8 @@ class SelfPlayManager:
         visit_dicts = []
         values = torch.zeros(n)
         rids = torch.zeros(n, dtype=torch.int64)
-        chain_t = torch.zeros(n, 2, BOARD_SIZE, BOARD_SIZE)
-        chain_m = torch.zeros(n, 2, BOARD_SIZE, BOARD_SIZE)
+        chain_t = torch.zeros(n, 6, BOARD_SIZE, BOARD_SIZE)
+        chain_m = torch.zeros(n, 6, BOARD_SIZE, BOARD_SIZE)
         ml = torch.zeros(n)
         dm = torch.zeros(n, dtype=torch.bool)
 
@@ -584,12 +584,14 @@ class SelfPlayManager:
             ml[i] = ex.get("moves_left", 0)
             dm[i] = bool(ex.get("game_drawn", False))
 
+        from training.selfplay.train_loop import CHAIN_VERSION
         cache_path = path.replace('.parquet', '.pt')
         torch.save({
             'planes': planes, 'visit_dicts': visit_dicts,
             'values': values, 'round_ids': rids,
             'chain_targets': chain_t, 'chain_masks': chain_m,
             'moves_left': ml, 'draw_mask': dm,
+            'chain_version': CHAIN_VERSION,
         }, cache_path)
 
         print(f"Saved {n:,} examples to {path} (+cache)")
