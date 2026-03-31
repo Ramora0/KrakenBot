@@ -486,7 +486,7 @@ def train(args):
     ckpt_path = os.path.join(args.output_dir, "checkpoint.pt")
 
     # wandb
-    use_wandb = args.wandb and HAS_WANDB
+    use_wandb = HAS_WANDB
     if use_wandb:
         try:
             wandb.init(
@@ -790,7 +790,7 @@ def main():
         os.path.dirname(__file__), "resnet_results"))
     parser.add_argument("--num-blocks", type=int, default=10)
     parser.add_argument("--num-filters", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -809,9 +809,7 @@ def main():
                         help="Checkpoint to resume from")
     parser.add_argument("--overfit-batches", type=int, default=0,
                         help="Train on N batches only (debug)")
-    parser.add_argument("--wandb", action="store_true",
-                        help="Log to Weights & Biases")
-    parser.add_argument("--log-every", type=int, default=50,
+parser.add_argument("--log-every", type=int, default=50,
                         help="Log to wandb every N steps (default: 50)")
     args = parser.parse_args()
     train(args)
