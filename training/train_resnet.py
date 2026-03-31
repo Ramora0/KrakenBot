@@ -351,6 +351,85 @@ def compute_loss(value_pred, pair_logits, ml_pred, chain_pred,
 
 
 # ---------------------------------------------------------------------------
+# Finishing evaluation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _find_finishing_positions(planes, wins, device, batch_size=1024):
+    """Find val indices where current player has unblocked chain >= N and won.
+
+    Returns {min_chain: index_tensor} for min_chain in [4, 5].
+    """
+    n = len(planes)
+    max_chains = torch.zeros(n)
+    for i in range(0, n, batch_size):
+        j = min(i + batch_size, n)
+        ct, _ = compute_chain_targets_batch(planes[i:j].to(device))
+        max_chains[i:j] = ct[:, 0].reshape(j - i, -1).max(dim=1).values.cpu()
+
+    win_mask = wins > 0
+    return {
+        mc: (win_mask & (max_chains >= mc)).nonzero(as_tuple=True)[0]
+        for mc in [4, 5]
+    }
+
+
+@torch.no_grad()
+def evaluate_finishing(model, device, planes, moves, finish_indices,
+                       batch_size=512):
+    """Check if model's top pair prediction completes 6-in-a-row.
+
+    Also checks the ground-truth (minimax) pair as a reference.
+    Returns {min_chain: (model_rate, gt_rate, n_positions)}.
+    """
+    N = BOARD_SIZE
+    NC = N * N
+    wq, wr = _get_chain_tables(torch.device('cpu'))[:2]
+
+    results = {}
+    for min_chain, indices in sorted(finish_indices.items()):
+        total = len(indices)
+        if total == 0:
+            results[min_chain] = (0.0, 0.0, 0)
+            continue
+
+        model_wins = 0
+        gt_wins = 0
+
+        for i in range(0, total, batch_size):
+            j = min(i + batch_size, total)
+            idx = indices[i:j]
+            B = len(idx)
+            b_range = torch.arange(B)
+
+            batch = planes[idx].to(device)
+            _, pair_logits, _, _ = model(batch)
+
+            top = pair_logits.reshape(B, -1).argmax(dim=-1).cpu()
+            pred_s1, pred_s2 = top // NC, top % NC
+
+            gt_pair = moves[idx]
+            gt_s1, gt_s2 = gt_pair[:, 0], gt_pair[:, 1]
+
+            base = planes[idx, 0]  # [B, H, W]
+
+            for s1, s2, label in [(pred_s1, pred_s2, 'model'),
+                                   (gt_s1, gt_s2, 'gt')]:
+                board = base.clone()
+                board[b_range, s1 // N, s1 % N] = 1
+                board[b_range, s2 // N, s2 % N] = 1
+                won = (board[:, wq, wr].sum(dim=2) >= 6).any(dim=1).sum().item()
+                if label == 'model':
+                    model_wins += won
+                else:
+                    gt_wins += won
+
+        results[min_chain] = (model_wins / total, gt_wins / total, total)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -366,6 +445,18 @@ def train(args):
         train_ds = torch.utils.data.Subset(train_ds, range(n))
         val_ds = torch.utils.data.Subset(val_ds, range(min(n, len(val_ds))))
         print(f"  Overfit mode: {len(train_ds)} train / {len(val_ds)} val")
+
+    # Precompute finishing eval positions from val set
+    if hasattr(val_ds, 'tensors'):
+        _vp, _vm, _vw = val_ds.tensors[0], val_ds.tensors[1], val_ds.tensors[2]
+    else:
+        _si = list(val_ds.indices)
+        _vp = val_ds.dataset.tensors[0][_si]
+        _vm = val_ds.dataset.tensors[1][_si]
+        _vw = val_ds.dataset.tensors[2][_si]
+    finish_idx = _find_finishing_positions(_vp, _vw, device)
+    for mc, idx in sorted(finish_idx.items()):
+        print(f"  Finishing eval: {len(idx):,} val positions with chain>={mc}")
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -637,6 +728,13 @@ def train(args):
             f"lr={lr_now:.6f} | {elapsed:.0f}s"
         )
 
+        # Finishing eval
+        finish = evaluate_finishing(model, device, _vp, _vm, finish_idx)
+        parts = []
+        for mc, (mr, gr, n) in sorted(finish.items()):
+            parts.append(f"c>={mc}: model={mr:.1%} gt={gr:.1%} (n={n:,})")
+        print(f"  finish: {' | '.join(parts)}")
+
         if use_wandb:
             wandb.log({
                 "epoch": epoch + 1,
@@ -654,6 +752,10 @@ def train(args):
                 "val/pair_acc": pair_correct / n_val,
                 "val/either_cell_acc": either_correct / n_val,
                 "val/ml_mae": ml_abs_err / n_val,
+                **{f"val/finish_model_c{mc}": mr
+                   for mc, (mr, _, _) in finish.items()},
+                **{f"val/finish_gt_c{mc}": gr
+                   for mc, (_, gr, _) in finish.items()},
             }, step=global_step)
 
         # Checkpoint
