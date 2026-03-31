@@ -5,7 +5,7 @@ interactive HTML viewer to browse games, step through turns, and see
 MCTS visit distributions.
 
 Usage:
-    python -m training.view_selfplay [--port 8766] [--data-dir training/data/selfplay]
+    python -m tools.view_selfplay [--port 8766] [--data-dir training/data/selfplay]
 """
 
 import argparse
@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 import pandas as pd
 
-from mcts.model import BOARD_SIZE
+from model.resnet import BOARD_SIZE
 
 N = BOARD_SIZE  # flat index = q * N + r
 

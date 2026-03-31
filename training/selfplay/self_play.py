@@ -29,7 +29,7 @@ from mcts.tree import (
     expand_and_backprop, maybe_expand_leaf, get_pair_visits, get_single_visits,
     select_move_pair, select_single_move,
 )
-from mcts.model import BOARD_SIZE
+from model.resnet import BOARD_SIZE
 from game import ToroidalHexGame, TORUS_SIZE
 
 try:
@@ -529,7 +529,7 @@ class SelfPlayManager:
     def save_round(self, examples: list[dict], round_id: int, output_dir: str):
         """Save examples as parquet + pre-built .pt cache for instant training."""
         import pandas as pd
-        from training.train_loop import compute_chain_targets
+        from training.selfplay.train_loop import compute_chain_targets
 
         os.makedirs(output_dir, exist_ok=True)
         path = os.path.join(output_dir, f"round_{round_id}.parquet")

@@ -1,6 +1,6 @@
 """Build Cython extensions for MCTS.
 
-Usage: python training/setup_puct.py build_ext --inplace
+Usage: python setup_puct.py build_ext --inplace
 """
 
 from setuptools import setup, Extension

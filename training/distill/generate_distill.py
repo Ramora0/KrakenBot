@@ -12,7 +12,7 @@ Output: Parquet file with columns:
   win_score      - float, +1.0 win / -1.0 loss / 0.0 draw from current_player POV
   game_id        - int, unique per generated game
 
-Usage: python -m training.generate_distill [--num-games 100000]
+Usage: python -m training.distill.generate_distill [--num-games 100000]
 """
 
 import json

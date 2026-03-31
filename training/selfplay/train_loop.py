@@ -1,7 +1,7 @@
 """MCTS self-play training loop: generate → train → evaluate.
 
 Usage:
-    python -m training.train_loop --rounds 10 --amp
+    python -m training.selfplay.train_loop --rounds 10 --amp
 """
 
 import argparse
@@ -18,8 +18,8 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from game import HexGame, HEX_DIRECTIONS, Player
-from mcts.model import BOARD_SIZE, HexResNet, board_to_planes_torus
-from mcts.symmetry import (
+from model.resnet import BOARD_SIZE, HexResNet, board_to_planes_torus
+from model.symmetry import (
     apply_symmetry_planes, PERMS, N as SYM_N,
 )
 
@@ -927,7 +927,7 @@ def main():
     # Game viewer
     viewer = None
     if not args.no_viewer:
-        from training.game_viewer import GameViewer
+        from tools.game_viewer import GameViewer
         viewer = GameViewer(port=args.viewer_port)
         viewer.start()
 
@@ -957,7 +957,7 @@ def main():
         t0 = time.time()
 
         # --- 1. Self-play ---
-        from training.self_play import SelfPlayManager, COMPLETED_PER_ROUND
+        from training.selfplay.self_play import SelfPlayManager, COMPLETED_PER_ROUND
         print(f"\n--- Self-play ---")
         model.eval()
         model.bfloat16()
@@ -966,7 +966,7 @@ def main():
                         and args.batch_size >= 16
                         and not args.no_parallel)
         if use_parallel:
-            from training.parallel_selfplay import generate_parallel
+            from training.selfplay.parallel_selfplay import generate_parallel
             examples, draw_rate = generate_parallel(
                 model, device,
                 batch_size=args.batch_size,

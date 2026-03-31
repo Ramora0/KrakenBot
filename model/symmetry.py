@@ -8,7 +8,7 @@ training samples so the model sees each position in all orientations.
 import numpy as np
 import torch
 
-from mcts.model import BOARD_SIZE
+from model.resnet import BOARD_SIZE
 
 N = BOARD_SIZE  # 25
 

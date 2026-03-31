@@ -1,6 +1,6 @@
 """Benchmark MCTS self-play simulation loop on GPU.
 
-Usage: python -m training.benchmark [--batch 256] [--sims 200]
+Usage: python -m tools.benchmark [--batch 256] [--sims 200]
 """
 
 import argparse
@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from game import ToroidalHexGame, TORUS_SIZE
-from mcts.model import HexResNet, BOARD_SIZE
+from model.resnet import HexResNet, BOARD_SIZE
 from mcts.tree import (
     create_trees_batched, select_leaf, expand_and_backprop,
     maybe_expand_leaf, N_CELLS, NON_ROOT_TOP_K,

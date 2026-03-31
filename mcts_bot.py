@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from bot import Bot
 from game import HexGame, ToroidalHexGame, TORUS_SIZE
 from mcts.tree import N_CELLS, NON_ROOT_TOP_K
-from mcts.model import HexResNet
+from model.resnet import HexResNet
 
 _DEFAULT_MODEL_PATH = os.path.join(
     os.path.dirname(__file__), "training", "resnet_results", "best.pt"

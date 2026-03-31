@@ -13,7 +13,7 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-from mcts.model import BOARD_SIZE
+from model.resnet import BOARD_SIZE
 
 MAX_FINISHED = 2000
 

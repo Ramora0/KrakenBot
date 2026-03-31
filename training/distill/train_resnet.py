@@ -6,7 +6,7 @@ Only double-move examples are used for policy training (single-move mid-turn
 examples are filtered out).
 
 Usage:
-  python -m training.train_resnet --epochs 5 --batch-size 512 --amp --wandb
+  python -m training.distill.train_resnet --epochs 5 --batch-size 512 --amp --wandb
 """
 
 import argparse
@@ -30,7 +30,7 @@ except ImportError:
     HAS_WANDB = False
 
 from game import HEX_DIRECTIONS
-from mcts.model import BOARD_SIZE, HexResNet
+from model.resnet import BOARD_SIZE, HexResNet
 
 CACHE_VERSION = "v2"  # bumped: now includes moves_left
 

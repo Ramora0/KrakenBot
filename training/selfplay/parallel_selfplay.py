@@ -30,7 +30,7 @@ from mcts.tree import (
     expand_and_backprop, maybe_expand_leaf, get_pair_visits, get_single_visits,
     select_move_pair, select_single_move, _build_tree_from_eval,
 )
-from mcts.model import BOARD_SIZE, HexResNet
+from model.resnet import BOARD_SIZE, HexResNet
 
 try:
     from mcts._mcts_cy import CyGameState, select_leaf_cy, backprop_cy
@@ -38,7 +38,7 @@ try:
 except ImportError:
     _HAS_CY = False
 
-from training.self_play import (
+from training.selfplay.self_play import (
     MAX_GAME_MOVES, COMPLETED_PER_ROUND, COLD_START_GAMES, SelfPlaySlot,
     _CENTER,
 )

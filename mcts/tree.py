@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from game import Player
-from mcts.model import BOARD_SIZE
+from model.resnet import BOARD_SIZE
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -304,7 +304,7 @@ def create_tree(
     add_noise: bool = True,
 ) -> MCTSTree:
     """Create a single MCTS tree with one B=1 NN forward pass."""
-    from mcts.model import board_to_planes_torus
+    from model.resnet import board_to_planes_torus
 
     planes = board_to_planes_torus(game.board, game.current_player)
 
@@ -329,7 +329,7 @@ def create_trees_batched(
     add_noise: bool = True,
 ) -> list[MCTSTree]:
     """Create trees for multiple games in one batched forward pass."""
-    from mcts.model import board_to_planes_torus
+    from model.resnet import board_to_planes_torus
 
     B = len(games)
     if B == 0:
