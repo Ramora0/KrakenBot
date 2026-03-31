@@ -1,16 +1,18 @@
 """Generate ResNet distillation data from bot self-play.
 
 Plays games from early human-game positions using the C++ bot on both sides.
-Each double move generates 3 training examples (original + 2 sub-move positions).
+Each turn generates one training example with the bot's full double move.
 Games where the board exceeds 19x19 bounding box are discarded.
 
 Output: Parquet file with columns:
-  board          - JSON string of board state {"q,r": player_int, ...}
-  current_player - int (1=Player.A, 2=Player.B)
-  moves          - list of [q,r] pairs: [[q0,r0],[q1,r1]] or [[q0,r0]]
-  eval_score     - float, bot.last_score / SCORE_SCALE
-  win_score      - float, +1.0 win / -1.0 loss / 0.0 draw from current_player POV
-  game_id        - int, unique per generated game
+  board            - JSON string of board state {"q,r": player_int, ...}
+  current_player   - int (1=Player.A, 2=Player.B)
+  moves            - list of [q,r] pairs: always [[q0,r0],[q1,r1]]
+  eval_score       - float, bot.last_score / SCORE_SCALE
+  win_score        - float, +1.0 win / -1.0 loss / 0.0 draw from current_player POV
+  game_id          - int, unique per generated game
+  winning_singles  - JSON list of [q,r] cells that each win alone (empty if N/A)
+  winning_pairs    - JSON list of [[q1,r1],[q2,r2]] pairs that win together (empty if N/A)
 
 Usage: python -m training.distill.generate_distill [--num-games 100000]
 """
@@ -61,6 +63,69 @@ def _board_has_win(board):
 def _board_to_json(board):
     """Convert board dict to JSON string with 'q,r' keys and int values."""
     return json.dumps({f"{q},{r}": p.value for (q, r), p in board.items()})
+
+
+def _find_winning_moves(board, player):
+    """Find all single-cell and pair wins for player on the current board.
+
+    Scans every 6-cell window (3 hex directions) that contains at least one
+    of *player*'s stones.  Windows with 5 friendly / 0 enemy yield a winning
+    single (the one empty cell).  Windows with 4 friendly / 0 enemy yield a
+    winning pair (the two empty cells).
+
+    Returns (winning_singles, winning_pairs):
+        winning_singles: list of [q, r]
+        winning_pairs:   list of [[q1, r1], [q2, r2]]
+    """
+    seen_singles = set()
+    seen_pairs = set()
+    winning_singles = []
+    winning_pairs = []
+
+    player_cells = {pos for pos, p in board.items() if p == player}
+
+    for dq, dr in HEX_DIRECTIONS:
+        checked = set()
+        for bq, br in player_cells:
+            for offset in range(_WIN_LENGTH):
+                sq = bq - dq * offset
+                sr = br - dr * offset
+                key = (sq, sr, dq, dr)
+                if key in checked:
+                    continue
+                checked.add(key)
+
+                my = 0
+                opp = 0
+                empties = []
+                for i in range(_WIN_LENGTH):
+                    c = (sq + dq * i, sr + dr * i)
+                    v = board.get(c)
+                    if v == player:
+                        my += 1
+                    elif v is not None:
+                        opp += 1
+                        break          # blocked — skip rest
+                    else:
+                        empties.append(c)
+
+                if opp > 0:
+                    continue
+
+                if my == 5 and len(empties) == 1:
+                    c = empties[0]
+                    if c not in seen_singles:
+                        seen_singles.add(c)
+                        winning_singles.append(list(c))
+
+                elif my == 4 and len(empties) == 2:
+                    pair = tuple(sorted(empties))
+                    if pair not in seen_pairs:
+                        seen_pairs.add(pair)
+                        winning_pairs.append(
+                            [list(empties[0]), list(empties[1])])
+
+    return winning_singles, winning_pairs
 
 
 def _load_starting_positions(path, max_stones=11, seed=42):
@@ -114,8 +179,8 @@ def _load_starting_positions(path, max_stones=11, seed=42):
 def _play_one_game(args):
     """Play one game from a starting position, collecting training examples.
 
-    Returns list of dicts (one per training example), or None if game
-    should be discarded (board exceeded 19x19).
+    Returns (examples, total_moves, finish_type) where finish_type is
+    'single' (stone 1 won), 'double' (stone 2 won), or None (discarded).
     """
     board, cp, _human_gid, time_limit, time_jitter, pattern_path, game_id, seed = args
 
@@ -136,8 +201,7 @@ def _play_one_game(args):
     bot_b = MinimaxBot(tl_b, pattern_path)
     bots = {Player.A: bot_a, Player.B: bot_b}
 
-    # Collect per-turn data: (board_snap, player, moves_played, eval_score)
-    # moves_played tracks only moves actually executed (not m2 if m1 won)
+    # Collect per-turn data
     turn_records = []
     total_moves = 0
     forfeit_player = None
@@ -153,7 +217,7 @@ def _play_one_game(args):
         moves_played = []
         for q, r in moves:
             if game.game_over:
-                break  # game ended on previous move, skip rest
+                break
             if not game.make_move(q, r):
                 forfeit_player = player
                 break
@@ -166,16 +230,26 @@ def _play_one_game(args):
             break
 
         if not _board_bbox_ok(game.board):
-            return None, 0
+            return None, 0, None
 
     if forfeit_player is not None:
         winner = Player.B if forfeit_player == Player.A else Player.A
     else:
         winner = game.winner
 
-    # Build training examples
+    # Determine finish type from last turn
+    finish_type = None
+    if winner != Player.NONE and turn_records:
+        last_played = turn_records[-1][3]  # moves_played
+        if len(last_played) == 1:
+            finish_type = 'single'
+        elif len(last_played) == 2:
+            finish_type = 'double'
+
+    # Build training examples — always record bot's full recommended pair
     examples = []
-    for board_snap, player, moves, moves_played, eval_score in turn_records:
+    n_turns = len(turn_records)
+    for idx, (board_snap, player, moves, moves_played, eval_score) in enumerate(turn_records):
         if winner == Player.NONE:
             win_score = 0.0
         elif winner == player:
@@ -183,59 +257,32 @@ def _play_one_game(args):
         else:
             win_score = -1.0
 
-        board_json = _board_to_json(board_snap)
+        if len(moves) < 2:
+            continue  # skip if bot returned only 1 move (shouldn't happen)
 
-        if len(moves) == 2 and len(moves_played) == 2:
-            m1, m2 = moves[0], moves[1]
+        m1, m2 = moves[0], moves[1]
+        ex = {
+            "board": _board_to_json(board_snap),
+            "current_player": player.value,
+            "moves": [list(m1), list(m2)],
+            "eval_score": eval_score,
+            "win_score": win_score,
+            "game_id": game_id,
+        }
 
-            # Example 1: full turn - both moves
-            examples.append({
-                "board": board_json,
-                "current_player": player.value,
-                "moves": [list(m1), list(m2)],
-                "eval_score": eval_score,
-                "win_score": win_score,
-                "game_id": game_id,
-            })
-
-            # Example 2: after m1, target is m2
-            board_with_m1 = dict(board_snap)
-            board_with_m1[m1] = player
-            if _board_bbox_ok(board_with_m1):
-                examples.append({
-                    "board": _board_to_json(board_with_m1),
-                    "current_player": player.value,
-                    "moves": [list(m2)],
-                    "eval_score": eval_score,
-                    "win_score": win_score,
-                    "game_id": game_id,
-                })
-
-            # Example 3: after m2, target is m1
-            board_with_m2 = dict(board_snap)
-            board_with_m2[m2] = player
-            if _board_bbox_ok(board_with_m2):
-                examples.append({
-                    "board": _board_to_json(board_with_m2),
-                    "current_player": player.value,
-                    "moves": [list(m1)],
-                    "eval_score": eval_score,
-                    "win_score": win_score,
-                    "game_id": game_id,
-                })
+        # For game-ending turn of the winner, enumerate all winning options
+        is_last = (idx == n_turns - 1)
+        if is_last and win_score > 0 and winner != Player.NONE:
+            ws, wp = _find_winning_moves(board_snap, player)
+            ex["winning_singles"] = json.dumps(ws)
+            ex["winning_pairs"] = json.dumps(wp)
         else:
-            # Single move (game ended on m1, or bot returned only 1 move)
-            m = moves_played[0] if moves_played else moves[0]
-            examples.append({
-                "board": board_json,
-                "current_player": player.value,
-                "moves": [list(m)],
-                "eval_score": eval_score,
-                "win_score": win_score,
-                "game_id": game_id,
-            })
+            ex["winning_singles"] = "[]"
+            ex["winning_pairs"] = "[]"
 
-    return examples, total_moves
+        examples.append(ex)
+
+    return examples, total_moves, finish_type
 
 
 def main():
@@ -290,6 +337,8 @@ def main():
     wins = 0
     losses = 0
     draws = 0
+    single_finishes = 0
+    double_finishes = 0
     games_since_save = 0
     t0 = time.time()
 
@@ -297,7 +346,7 @@ def main():
         with Pool(workers) as pool:
             pbar = tqdm(pool.imap(_play_one_game, tasks, chunksize=4),
                         total=len(tasks), desc="Games", unit="game")
-            for examples, move_count in pbar:
+            for examples, move_count, finish_type in pbar:
                 games_completed += 1
 
                 if examples is None:
@@ -305,7 +354,6 @@ def main():
                 else:
                     all_examples.extend(examples)
                     total_game_moves += move_count
-                    # Count outcome from first example
                     ws = examples[0]["win_score"]
                     if ws > 0:
                         wins += 1
@@ -313,10 +361,15 @@ def main():
                         losses += 1
                     else:
                         draws += 1
+                    if finish_type == 'single':
+                        single_finishes += 1
+                    elif finish_type == 'double':
+                        double_finishes += 1
 
                 kept = games_completed - games_discarded
                 avg_moves = total_game_moves / kept if kept else 0
                 pbar.set_postfix(W=wins, L=losses, D=draws,
+                                 s1=single_finishes, s2=double_finishes,
                                  avg_mv=f"{avg_moves:.0f}")
 
                 games_since_save += 1
@@ -338,11 +391,18 @@ def main():
     print(f"  Games: {games_completed} completed, {games_discarded} discarded "
           f"({100 * games_discarded / max(games_completed, 1):.1f}% bbox exceeded)")
     print(f"  Outcomes (kept): {wins}W / {losses}L / {draws}D")
+    print(f"  Finishes: {single_finishes} stone-1 / {double_finishes} stone-2 "
+          f"({100 * single_finishes / max(kept, 1):.1f}% / "
+          f"{100 * double_finishes / max(kept, 1):.1f}%)")
     print(f"  Training examples: {len(all_examples):,}")
     if kept > 0:
         print(f"  Avg examples/game: {len(all_examples) / kept:.1f}")
     if all_examples:
+        n_with_wins = sum(1 for e in all_examples
+                          if e["winning_singles"] != "[]"
+                          or e["winning_pairs"] != "[]")
         evals = [e["eval_score"] for e in all_examples]
+        print(f"  Examples with winning moves: {n_with_wins:,}")
         print(f"  Eval range: [{min(evals):.3f}, {max(evals):.3f}], "
               f"mean={sum(evals) / len(evals):.4f}")
     print(f"Saved to {args.output}")
