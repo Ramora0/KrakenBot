@@ -77,8 +77,8 @@ cdef class CyGameState:
             count = 1
             # Forward
             for i in range(1, WIN_LEN):
-                nq = (q + DQ[d] * i) % TORUS
-                nr = (r + DR[d] * i) % TORUS
+                nq = (q + DQ[d] * i + TORUS) % TORUS
+                nr = (r + DR[d] * i + TORUS) % TORUS
                 if self.board[nq * TORUS + nr] == player:
                     count += 1
                 else:

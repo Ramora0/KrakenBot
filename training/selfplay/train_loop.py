@@ -77,7 +77,7 @@ def _precompute_chain_tables(N=BOARD_SIZE, win_len=6):
 _WIN_QS, _WIN_RS, _CW_PER_DIR, _CM_PER_DIR = _precompute_chain_tables()
 
 
-CHAIN_VERSION = 2  # bump when chain target shape changes
+CHAIN_VERSION = 3  # bump when cached fields change (added current_players)
 
 
 def compute_chain_targets(board_dict, current_player):
@@ -148,6 +148,7 @@ class SelfPlayDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, planes, visit_dicts, values, round_ids,
+                 current_players,
                  chain_targets, chain_masks, moves_left, draw_mask,
                  current_round, decay=0.75, augment=True):
         self.planes = planes              # [N, 2, 25, 25]
@@ -162,6 +163,32 @@ class SelfPlayDataset(torch.utils.data.Dataset):
 
         ages = current_round - round_ids.float()
         self.weights = decay ** ages
+
+        # --- Outcome-balanced sampling ---
+        # Determine absolute game outcome per example:
+        #   A-win: (cp==1 and val>0) or (cp==2 and val<0)
+        #   B-win: (cp==2 and val>0) or (cp==1 and val<0)
+        #   draw:  draw_mask is True
+        # Reweight so A-win and B-win examples have equal total weight.
+        cp = current_players.float()
+        v = values
+        a_win = ((cp == 1) & (v > 0)) | ((cp == 2) & (v < 0))
+        b_win = ((cp == 2) & (v > 0)) | ((cp == 1) & (v < 0))
+        # Draws and SFT (cp==0) get no reweighting
+        a_win = a_win & ~draw_mask
+        b_win = b_win & ~draw_mask
+
+        w_a = self.weights[a_win].sum()
+        w_b = self.weights[b_win].sum()
+        if w_a > 0 and w_b > 0:
+            # Scale the overrepresented side down to match the underrepresented
+            target = (w_a + w_b) / 2
+            self.weights[a_win] *= target / w_a
+            self.weights[b_win] *= target / w_b
+            pct_a = a_win.sum().item() / max(1, (a_win | b_win).sum().item())
+            print(f"  Outcome balance: {a_win.sum().item():,} A-win examples, "
+                  f"{b_win.sum().item():,} B-win examples "
+                  f"({pct_a:.0%} / {1 - pct_a:.0%}) — weights equalized")
 
     def __len__(self):
         return len(self.values)
@@ -327,6 +354,7 @@ def _preprocess_round(parquet_path: str) -> dict:
     visit_dicts = []
     values = torch.zeros(n)
     rids = torch.zeros(n, dtype=torch.int64)
+    cps = torch.zeros(n, dtype=torch.int8)
     chain_t = torch.zeros(n, 6, bs, bs)
     chain_m = torch.zeros(n, 6, bs, bs)
     ml = torch.zeros(n)
@@ -341,6 +369,7 @@ def _preprocess_round(parquet_path: str) -> dict:
             for k, v in json.loads(row.board).items()
         }
         cp = int(row.current_player)
+        cps[i] = cp
         planes[i] = board_to_planes_torus(board_dict, cp)
         ct, cm = compute_chain_targets(board_dict, cp)
         chain_t[i] = ct
@@ -367,6 +396,7 @@ def _preprocess_round(parquet_path: str) -> dict:
     result = {
         'planes': planes, 'visit_dicts': visit_dicts,
         'values': values, 'round_ids': rids,
+        'current_players': cps,
         'chain_targets': chain_t, 'chain_masks': chain_m,
         'moves_left': ml, 'draw_mask': dm,
         'chain_version': CHAIN_VERSION,
@@ -388,7 +418,7 @@ def load_selfplay_rounds(data_dir: str, current_round: int,
     rounds = range(max(0, current_round - window + 1), current_round + 1)
 
     all_planes, all_visits, all_values = [], [], []
-    all_rids, all_ct, all_cm, all_ml, all_dm = [], [], [], [], []
+    all_rids, all_cps, all_ct, all_cm, all_ml, all_dm = [], [], [], [], [], []
 
     for r in rounds:
         path = os.path.join(data_dir, f"round_{r}.parquet")
@@ -399,6 +429,8 @@ def load_selfplay_rounds(data_dir: str, current_round: int,
         all_visits.extend(d['visit_dicts'])
         all_values.append(d['values'])
         all_rids.append(d['round_ids'])
+        all_cps.append(d.get('current_players', torch.ones(len(d['values']),
+                                                            dtype=torch.int8)))
         all_ct.append(d['chain_targets'])
         all_cm.append(d['chain_masks'])
         all_ml.append(d['moves_left'])
@@ -410,6 +442,7 @@ def load_selfplay_rounds(data_dir: str, current_round: int,
     planes_tensor = torch.cat(all_planes)
     value_tensor = torch.cat(all_values)
     round_ids = torch.cat(all_rids)
+    current_players = torch.cat(all_cps)
     chain_targets = torch.cat(all_ct)
     chain_masks = torch.cat(all_cm)
     moves_left_tensor = torch.cat(all_ml)
@@ -440,9 +473,13 @@ def load_selfplay_rounds(data_dir: str, current_round: int,
                 moves_left_tensor, torch.zeros(n_sft)])
             draw_mask = torch.cat([
                 draw_mask, torch.ones(n_sft, dtype=torch.bool)])
+            # SFT: mark as player 0 so outcome balancing skips them
+            current_players = torch.cat([
+                current_players, torch.zeros(n_sft, dtype=torch.int8)])
 
     dataset = SelfPlayDataset(
         planes_tensor, visit_dicts, value_tensor, round_ids,
+        current_players,
         chain_targets, chain_masks, moves_left_tensor, draw_mask,
         current_round, decay=decay, augment=augment,
     )
@@ -1093,151 +1130,179 @@ def main():
                 "round": start_round - 1,
             }, commit=True)
 
-    for round_num in range(start_round, start_round + args.rounds):
-        print(f"\n{'='*60}")
-        print(f"  ROUND {round_num}")
-        print(f"{'='*60}")
-        t0 = time.time()
-
-        # --- 1. Self-play ---
-        from training.selfplay.self_play import SelfPlayManager, COMPLETED_PER_ROUND
-        print(f"\n--- Self-play ---")
-        model.eval()
-        model.bfloat16()
-
-        use_parallel = (device.type == 'cuda'
-                        and args.batch_size >= 16
-                        and not args.no_parallel)
-        if use_parallel:
-            from training.selfplay.parallel_selfplay import generate_parallel
-            examples, draw_rate = generate_parallel(
-                model, device,
-                batch_size=args.batch_size,
-                n_sims=args.n_sims,
-                round_id=round_num,
-                data_dir=args.data_dir,
-                n_workers=args.n_workers,
-                late_temperature=args.late_temperature,
-                draw_penalty=args.draw_penalty,
-                model_kwargs={
-                    'num_blocks': args.num_blocks,
-                    'num_filters': args.num_filters,
-                },
-                viewer=viewer,
-            )
-            # Save examples
-            manager = SelfPlayManager(model, device, data_dir=args.data_dir)
-            manager.save_round(examples, round_num, args.data_dir)
-        else:
-            manager = SelfPlayManager(
-                model, device,
-                batch_size=args.batch_size,
-                n_sims=args.n_sims,
-                data_dir=args.data_dir,
-                viewer=viewer,
-                late_temperature=args.late_temperature,
-                draw_penalty=args.draw_penalty,
-            )
-            examples, draw_rate = manager.generate(round_num)
-            manager.save_round(examples, round_num, args.data_dir)
-
-        model.float()
-        t_gen = time.time() - t0
-
-        # --- 2. Train ---
-        # Anneal SFT weight linearly to 0
-        if args.sft_path and args.sft_anneal_rounds > 0:
-            progress = min(round_num / args.sft_anneal_rounds, 1.0)
-            cur_sft_weight = args.sft_weight * (1.0 - progress)
-        else:
-            cur_sft_weight = args.sft_weight
-        sft_path = args.sft_path if cur_sft_weight > 0 else None
-
-        print(f"\n--- Training (window={args.window}, decay={args.decay}"
-              f"{f', sft_weight={cur_sft_weight:.3f}' if sft_path else ''}) ---")
-        t1 = time.time()
-        dataset = load_selfplay_rounds(args.data_dir, round_num,
-                                       window=args.window,
-                                       decay=args.decay,
-                                       sft_path=sft_path,
-                                       sft_weight=cur_sft_weight,
-                                       sft_max_examples=args.sft_max_examples)
-        losses = train_one_epoch(
-            model, optimizer, dataset, device,
-            batch_size=args.train_batch_size,
-            use_amp=use_amp,
-            scaler=scaler,
-            value_weight=args.value_weight,
+    # Create persistent worker pool if using parallel self-play
+    use_parallel = (device.type == 'cuda'
+                    and args.batch_size >= 16
+                    and not args.no_parallel)
+    pool = None
+    if use_parallel:
+        from training.selfplay.parallel_selfplay import (
+            ParallelSelfPlayPool, COLD_START_GAMES, COMPLETED_PER_ROUND,
         )
-        avg_loss, avg_vloss, avg_ploss, avg_ml, avg_chain = losses
-        t_train = time.time() - t1
-        print(f"  Loss: {avg_loss:.4f} (value={avg_vloss:.4f}, "
-              f"policy={avg_ploss:.4f}, ml={avg_ml:.4f}, "
-              f"chain={avg_chain:.4f})")
+        pending_path = os.path.join(args.data_dir, "pending.json")
+        game_dicts = [None] * args.batch_size
+        next_game_id = 0
+        is_cold_start = True
+        if os.path.exists(pending_path):
+            with open(pending_path, 'r') as f:
+                pd = json.load(f)
+            for i, item in enumerate(pd["games"][:args.batch_size]):
+                game_dicts[i] = item
+            next_game_id = pd["next_game_id"]
+            is_cold_start = False
+            print(f"Resumed {len(pd['games'])} in-progress games")
+        else:
+            next_game_id = args.batch_size
 
-        # --- 3. Checkpoint ---
-        ckpt_path = save_checkpoint(model, optimizer, scaler, round_num,
-                                    args.output_dir, best_win_rate,
-                                    crossover_time=crossover_time)
+        model_dtype = next(model.parameters()).dtype
+        pool = ParallelSelfPlayPool(
+            args.batch_size, args.n_sims, args.n_workers, model_dtype)
+        pool.start(game_dicts, next_game_id)
 
-        # --- 4. Evaluate (every eval_every rounds) ---
-        eval_result = None
-        win_rate = None
-        t_eval = 0.0
-        if (round_num + 1) % args.eval_every == 0:
-            center = crossover_time if crossover_time is not None else args.minimax_time
-            print(f"\n--- Evaluation: {args.eval_games} games, "
-                  f"center={center:.4f}s ---")
-            t2 = time.time()
-            eval_result = evaluate_crossover(
-                model, device, n_games=args.eval_games,
-                n_sims=args.eval_sims, center=center,
+    try:
+        for round_num in range(start_round, start_round + args.rounds):
+            print(f"\n{'='*60}")
+            print(f"  ROUND {round_num}")
+            print(f"{'='*60}")
+            t0 = time.time()
+
+            # --- 1. Self-play ---
+            from training.selfplay.self_play import SelfPlayManager
+            print(f"\n--- Self-play ---")
+            model.eval()
+            model.bfloat16()
+
+            if use_parallel:
+                target = COLD_START_GAMES if (
+                    is_cold_start and round_num == start_round
+                ) else COMPLETED_PER_ROUND
+                examples, draw_rate = pool.generate_round(
+                    model, device,
+                    round_id=round_num,
+                    data_dir=args.data_dir,
+                    late_temperature=args.late_temperature,
+                    draw_penalty=args.draw_penalty,
+                    target=target,
+                    viewer=viewer,
+                )
+                # Save examples
+                manager = SelfPlayManager(
+                    model, device, data_dir=args.data_dir)
+                manager.save_round(examples, round_num, args.data_dir)
+            else:
+                manager = SelfPlayManager(
+                    model, device,
+                    batch_size=args.batch_size,
+                    n_sims=args.n_sims,
+                    data_dir=args.data_dir,
+                    viewer=viewer,
+                    late_temperature=args.late_temperature,
+                    draw_penalty=args.draw_penalty,
+                )
+                examples, draw_rate = manager.generate(round_num)
+                manager.save_round(examples, round_num, args.data_dir)
+
+            model.float()
+            t_gen = time.time() - t0
+
+            # --- 2. Train ---
+            # Anneal SFT weight linearly to 0
+            if args.sft_path and args.sft_anneal_rounds > 0:
+                progress = min(round_num / args.sft_anneal_rounds, 1.0)
+                cur_sft_weight = args.sft_weight * (1.0 - progress)
+            else:
+                cur_sft_weight = args.sft_weight
+            sft_path = args.sft_path if cur_sft_weight > 0 else None
+
+            print(f"\n--- Training (window={args.window}, decay={args.decay}"
+                  f"{f', sft_weight={cur_sft_weight:.3f}' if sft_path else ''}) ---")
+            t1 = time.time()
+            dataset = load_selfplay_rounds(
+                args.data_dir, round_num,
+                window=args.window, decay=args.decay,
+                sft_path=sft_path, sft_weight=cur_sft_weight,
+                sft_max_examples=args.sft_max_examples)
+            losses = train_one_epoch(
+                model, optimizer, dataset, device,
+                batch_size=args.train_batch_size,
+                use_amp=use_amp,
+                scaler=scaler,
+                value_weight=args.value_weight,
             )
-            t_eval = time.time() - t2
-            crossover_time = eval_result["crossover_time"]
-            win_rate = eval_result["score_mid"]
+            avg_loss, avg_vloss, avg_ploss, avg_ml, avg_chain = losses
+            t_train = time.time() - t1
+            print(f"  Loss: {avg_loss:.4f} (value={avg_vloss:.4f}, "
+                  f"policy={avg_ploss:.4f}, ml={avg_ml:.4f}, "
+                  f"chain={avg_chain:.4f})")
 
-            if win_rate > best_win_rate:
-                best_win_rate = win_rate
-                print(f"  New best win rate at mid time: {100 * best_win_rate:.1f}%")
+            # --- 3. Checkpoint ---
+            ckpt_path = save_checkpoint(model, optimizer, scaler, round_num,
+                                        args.output_dir, best_win_rate,
+                                        crossover_time=crossover_time)
 
-        t_total = time.time() - t0
+            # --- 4. Evaluate (every eval_every rounds) ---
+            eval_result = None
+            win_rate = None
+            t_eval = 0.0
+            if (round_num + 1) % args.eval_every == 0:
+                center = (crossover_time if crossover_time is not None
+                          else args.minimax_time)
+                print(f"\n--- Evaluation: {args.eval_games} games, "
+                      f"center={center:.4f}s ---")
+                t2 = time.time()
+                eval_result = evaluate_crossover(
+                    model, device, n_games=args.eval_games,
+                    n_sims=args.eval_sims, center=center,
+                )
+                t_eval = time.time() - t2
+                crossover_time = eval_result["crossover_time"]
+                win_rate = eval_result["score_mid"]
 
-        # --- Log ---
-        print(f"\n  Round {round_num} summary:")
-        print(f"    Examples: {len(examples):,}")
-        print(f"    Draw rate: {100 * draw_rate:.1f}%")
-        print(f"    Loss: {avg_loss:.4f}")
-        if eval_result is not None:
-            print(f"    Crossover time: {crossover_time:.4f}s")
-            print(f"    Scores: low={eval_result['score_low']:.2f} "
-                  f"mid={eval_result['score_mid']:.2f} "
-                  f"high={eval_result['score_high']:.2f}")
-        print(f"    Time: {t_gen:.0f}s gen + {t_train:.0f}s train "
-              f"+ {t_eval:.0f}s eval = {t_total:.0f}s total")
+                if win_rate > best_win_rate:
+                    best_win_rate = win_rate
+                    print(f"  New best win rate at mid time: "
+                          f"{100 * best_win_rate:.1f}%")
 
-        if use_wandb:
-            log_data = {
-                "round": round_num,
-                "loss": avg_loss,
-                "value_loss": avg_vloss,
-                "policy_loss": avg_ploss,
-                "moves_left_loss": avg_ml,
-                "chain_loss": avg_chain,
-                "best_win_rate": best_win_rate,
-                "draw_rate": draw_rate,
-                "examples": len(examples),
-                "time_gen": t_gen,
-                "time_train": t_train,
-                "time_eval": t_eval,
-            }
+            t_total = time.time() - t0
+
+            # --- Log ---
+            print(f"\n  Round {round_num} summary:")
+            print(f"    Examples: {len(examples):,}")
+            print(f"    Draw rate: {100 * draw_rate:.1f}%")
+            print(f"    Loss: {avg_loss:.4f}")
             if eval_result is not None:
-                log_data["eval/crossover_time"] = crossover_time
-                log_data["eval/score_low"] = eval_result["score_low"]
-                log_data["eval/score_mid"] = eval_result["score_mid"]
-                log_data["eval/score_high"] = eval_result["score_high"]
-                log_data["eval/win_rate"] = win_rate
-            wandb.log(log_data)
+                print(f"    Crossover time: {crossover_time:.4f}s")
+                print(f"    Scores: low={eval_result['score_low']:.2f} "
+                      f"mid={eval_result['score_mid']:.2f} "
+                      f"high={eval_result['score_high']:.2f}")
+            print(f"    Time: {t_gen:.0f}s gen + {t_train:.0f}s train "
+                  f"+ {t_eval:.0f}s eval = {t_total:.0f}s total")
+
+            if use_wandb:
+                log_data = {
+                    "round": round_num,
+                    "loss": avg_loss,
+                    "value_loss": avg_vloss,
+                    "policy_loss": avg_ploss,
+                    "moves_left_loss": avg_ml,
+                    "chain_loss": avg_chain,
+                    "best_win_rate": best_win_rate,
+                    "draw_rate": draw_rate,
+                    "examples": len(examples),
+                    "time_gen": t_gen,
+                    "time_train": t_train,
+                    "time_eval": t_eval,
+                }
+                if eval_result is not None:
+                    log_data["eval/crossover_time"] = crossover_time
+                    log_data["eval/score_low"] = eval_result["score_low"]
+                    log_data["eval/score_mid"] = eval_result["score_mid"]
+                    log_data["eval/score_high"] = eval_result["score_high"]
+                    log_data["eval/win_rate"] = win_rate
+                wandb.log(log_data)
+    finally:
+        if pool is not None:
+            pool.shutdown()
 
     print(f"\n{'='*60}")
     if crossover_time is not None:
