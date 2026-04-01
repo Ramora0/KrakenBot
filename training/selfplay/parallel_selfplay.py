@@ -130,6 +130,7 @@ def _worker_fn(worker_id, n_workers, batch_size, n_sims,
                game_dicts, next_game_id_start,
                shared_bufs, sync, round_id,
                late_temperature, draw_penalty,
+               noise_dist_scale,
                result_queue):
     """Worker process: owns games/trees, does select + backprop."""
     try:
@@ -137,6 +138,7 @@ def _worker_fn(worker_id, n_workers, batch_size, n_sims,
                      game_dicts, next_game_id_start,
                      shared_bufs, sync, round_id,
                      late_temperature, draw_penalty,
+                     noise_dist_scale,
                      result_queue)
     except Exception as e:
         sync['error'].value = 1
@@ -152,6 +154,7 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                  game_dicts, next_game_id_start,
                  shared_bufs, sync, round_id,
                  late_temperature, draw_penalty,
+                 noise_dist_scale,
                  result_queue):
     """Inner worker loop (unwrapped for clean error handling)."""
     games_per_worker = batch_size // n_workers
@@ -232,6 +235,7 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                     shared_bufs.tree_marginals[gi].clone(),
                     shared_bufs.tree_planes[gi].clone(),
                     add_noise=True,
+                    noise_dist_scale=noise_dist_scale,
                 )
 
         # Step 5: barrier + clear events
@@ -788,6 +792,7 @@ class ParallelSelfPlayPool:
         self._round_id = mp.Value('i', -1)
         self._late_temperature = mp.Value('f', 0.3)
         self._draw_penalty = mp.Value('f', 0.1)
+        self._noise_dist_scale = mp.Value('f', 0.0)
         self._round_stop = mp.Value('i', 0)
         self._new_round = mp.Event()
         # Barrier for workers + main to sync at round end
@@ -812,7 +817,8 @@ class ParallelSelfPlayPool:
                       game_dicts, next_game_id,
                       self.shared, self.sync,
                       self._round_id, self._late_temperature,
-                      self._draw_penalty, self._round_stop,
+                      self._draw_penalty, self._noise_dist_scale,
+                      self._round_stop,
                       self._new_round, self._round_end_barrier,
                       self._next_game_id,
                       self.result_queue),
@@ -823,6 +829,7 @@ class ParallelSelfPlayPool:
 
     def generate_round(self, model, device, round_id, data_dir,
                        late_temperature=0.3, draw_penalty=0.1,
+                       noise_dist_scale=0.0,
                        target=None, viewer=None):
         """Run one round of self-play. Returns (examples, draw_rate)."""
         if not self._alive:
@@ -835,6 +842,7 @@ class ParallelSelfPlayPool:
         self._round_id.value = round_id
         self._late_temperature.value = late_temperature
         self._draw_penalty.value = draw_penalty
+        self._noise_dist_scale.value = noise_dist_scale
         self._round_stop.value = 0
 
         # Reset sync state for fresh round
@@ -1050,6 +1058,7 @@ def _pool_worker_fn(worker_id, n_workers, batch_size, n_sims,
                     game_dicts, next_game_id_start,
                     shared_bufs, sync,
                     round_id_val, late_temp_val, draw_penalty_val,
+                    noise_dist_scale_val,
                     round_stop, new_round_event, round_end_barrier,
                     next_game_id_shared,
                     result_queue):
@@ -1060,6 +1069,7 @@ def _pool_worker_fn(worker_id, n_workers, batch_size, n_sims,
             game_dicts, next_game_id_start,
             shared_bufs, sync,
             round_id_val, late_temp_val, draw_penalty_val,
+            noise_dist_scale_val,
             round_stop, new_round_event, round_end_barrier,
             next_game_id_shared,
             result_queue)
@@ -1080,6 +1090,7 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                       game_dicts, next_game_id_start,
                       shared_bufs, sync,
                       round_id_val, late_temp_val, draw_penalty_val,
+                      noise_dist_scale_val,
                       round_stop, new_round_event, round_end_barrier,
                       next_game_id_shared,
                       result_queue):
@@ -1132,6 +1143,7 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
         round_id = round_id_val.value
         late_temperature = late_temp_val.value
         draw_penalty = draw_penalty_val.value
+        noise_dist_scale = noise_dist_scale_val.value
 
         # ---- Inner turn loop ----
         while not stop_flag.value and not round_stop.value:
@@ -1170,6 +1182,7 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                         shared_bufs.tree_marginals[gi].clone(),
                         shared_bufs.tree_planes[gi].clone(),
                         add_noise=True,
+                        noise_dist_scale=noise_dist_scale,
                     )
 
             wb.wait()

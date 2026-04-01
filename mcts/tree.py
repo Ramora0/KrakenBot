@@ -132,6 +132,7 @@ class MCTSTree:
     root_player: Player | None = None
     root_value: float = 0.0
     root_occupied: frozenset | None = None   # occupied cells at root
+    noise_dist_scale: float = 0.0            # for distance-aware exploration noise
 
 
 # ---------------------------------------------------------------------------
@@ -206,25 +207,77 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Dirichlet noise
+# Dirichlet noise (distance-aware)
 # ---------------------------------------------------------------------------
 
-def _add_exploration_noise(node: MCTSNode, alpha: float = DIRICHLET_ALPHA,
-                           frac: float = DIRICHLET_FRAC):
-    """Add Dirichlet noise to priors (standard AlphaZero).
+def _min_dist_to_stones_torus(q: int, r: int, occupied, N: int = BOARD_SIZE) -> int:
+    """Minimum hex distance from (q, r) to any occupied cell on the torus."""
+    min_d = N
+    for oq, or_ in occupied:
+        raw_dq = q - oq
+        raw_dr = r - or_
+        for a in (-1, 0, 1):
+            dq = raw_dq + a * N
+            for b in (-1, 0, 1):
+                dr = raw_dr + b * N
+                d = max(abs(dq), abs(dr), abs(dq + dr))
+                if d < min_d:
+                    min_d = d
+                    if d <= 1:
+                        return d
+    return min_d
 
-    final_prior = (1 - frac) * prior + frac * Dir(alpha)
-    No uniform noise -- it scatters stones across the board in games
-    where play should be clustered (gomoku, hex, connect-6).
+
+def _add_exploration_noise(node: MCTSNode, alpha: float = DIRICHLET_ALPHA,
+                           frac: float = DIRICHLET_FRAC,
+                           occupied: frozenset | None = None,
+                           noise_dist_scale: float = 0.0):
+    """Add Dirichlet noise to priors with distance-based weighting.
+
+    Each candidate's noise fraction is scaled by its hex distance to the
+    nearest existing stone:
+      d <= 2:  weight = 1.0  (full noise, matches distillation radius)
+      d > 2:   weight = exp(-(d - 2) / noise_dist_scale)
+
+    noise_dist_scale controls the exponential tail beyond dist 2:
+      0.0   -> noise only on cells within dist 2
+      1.0   -> dist 3 ≈ 37%, dist 4 ≈ 14%, dist 5 ≈ 5%
+      3.0   -> dist 3 ≈ 72%, dist 4 ≈ 51%, dist 5 ≈ 37%
+      large -> effectively uniform noise
     """
     if node.actions is None:
         return
     n = node.n
     dirichlet = np.random.dirichlet([alpha] * n)
-    keep = 1.0 - frac
     priors = node.priors
-    node.priors = [keep * priors[i] + frac * dirichlet[i]
-                   for i in range(n)]
+
+    if occupied is None or not occupied:
+        # No stones on board — apply uniform noise
+        keep = 1.0 - frac
+        node.priors = [keep * priors[i] + frac * dirichlet[i]
+                       for i in range(n)]
+        return
+
+    # Per-candidate noise fraction based on distance to nearest stone
+    new_priors = [0.0] * n
+    for i in range(n):
+        q, r = _idx_to_cell(node.actions[i])
+        d = _min_dist_to_stones_torus(q, r, occupied)
+        if d <= 2:
+            w = 1.0
+        elif noise_dist_scale <= 0.0:
+            w = 0.0
+        else:
+            w = math.exp(-(d - 2) / noise_dist_scale)
+        fi = frac * w
+        new_priors[i] = (1.0 - fi) * priors[i] + fi * dirichlet[i]
+
+    # Renormalize
+    total = sum(new_priors)
+    if total > 0:
+        node.priors = [p / total for p in new_priors]
+    else:
+        node.priors = new_priors
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +301,7 @@ def _build_tree_from_eval(
     marginal: torch.Tensor,
     root_planes: torch.Tensor,
     add_noise: bool = True,
+    noise_dist_scale: float = 0.0,
 ) -> MCTSTree:
     """Build an MCTSTree from pre-computed NN outputs (no model call).
 
@@ -270,6 +324,8 @@ def _build_tree_from_eval(
         occupied = game.board.keys()
         has_stones = bool(game.board)
 
+    occupied_frozen = frozenset(occupied)
+
     if has_stones:
         cands = _ALL_CELLS - set(occupied)
     else:
@@ -284,7 +340,8 @@ def _build_tree_from_eval(
     _init_node_children(pos.move_node, cand_priors)
 
     if add_noise:
-        _add_exploration_noise(pos.move_node)
+        _add_exploration_noise(pos.move_node, occupied=occupied_frozen,
+                               noise_dist_scale=noise_dist_scale)
 
     root_player = cp if hasattr(cp, 'value') else Player(cp)
     return MCTSTree(
@@ -293,7 +350,8 @@ def _build_tree_from_eval(
         root_planes=root_planes,
         root_player=root_player,
         root_value=root_value,
-        root_occupied=frozenset(occupied),
+        root_occupied=occupied_frozen,
+        noise_dist_scale=noise_dist_scale,
     )
 
 
@@ -302,6 +360,7 @@ def create_tree(
     model: torch.nn.Module,
     device: torch.device,
     add_noise: bool = True,
+    noise_dist_scale: float = 0.0,
 ) -> MCTSTree:
     """Create a single MCTS tree with one B=1 NN forward pass."""
     from model.resnet import board_to_planes_torus
@@ -318,7 +377,8 @@ def create_tree(
     marginal = pair_probs.sum(dim=-1)
 
     return _build_tree_from_eval(
-        game, root_value, pair_probs, marginal, planes, add_noise)
+        game, root_value, pair_probs, marginal, planes, add_noise,
+        noise_dist_scale=noise_dist_scale)
 
 
 @torch.no_grad()
@@ -327,6 +387,7 @@ def create_trees_batched(
     model: torch.nn.Module,
     device: torch.device,
     add_noise: bool = True,
+    noise_dist_scale: float = 0.0,
 ) -> list[MCTSTree]:
     """Create trees for multiple games in one batched forward pass."""
     from model.resnet import board_to_planes_torus
@@ -354,7 +415,8 @@ def create_trees_batched(
             N_CELLS, N_CELLS).cpu()
         mg = pp.sum(dim=-1)
         tree = _build_tree_from_eval(
-            game, root_value, pp, mg, batch[i].cpu(), add_noise)
+            game, root_value, pp, mg, batch[i].cpu(), add_noise,
+            noise_dist_scale=noise_dist_scale)
         trees.append(tree)
 
     return trees
@@ -395,7 +457,12 @@ def _expand_level2(
     _init_node_children(l2_node, cand_priors)
 
     if add_noise:
-        _add_exploration_noise(l2_node)
+        if hasattr(game, 'get_occupied_set'):
+            occ = game.get_occupied_set()
+        else:
+            occ = frozenset(game.board.keys())
+        _add_exploration_noise(l2_node, occupied=occ,
+                               noise_dist_scale=tree.noise_dist_scale)
 
     if pos.move_node.level2 is None:
         pos.move_node.level2 = {}

@@ -59,7 +59,8 @@ class SelfPlaySlot:
 class SelfPlayManager:
     def __init__(self, model, device, batch_size=256, n_sims=200,
                  data_dir="training/data/selfplay", viewer=None,
-                 late_temperature=0.3, draw_penalty=0.1):
+                 late_temperature=0.3, draw_penalty=0.1,
+                 noise_dist_scale=0.0):
         self.model = model
         self.device = device
         self.batch_size = batch_size
@@ -68,6 +69,7 @@ class SelfPlayManager:
         self.viewer = viewer
         self.late_temperature = late_temperature
         self.draw_penalty = draw_penalty
+        self.noise_dist_scale = noise_dist_scale
 
     def _load_or_create_slots(self) -> tuple[list[SelfPlaySlot], int, bool]:
         """Load pending games from previous round, or create all fresh slots.
@@ -446,7 +448,8 @@ class SelfPlayManager:
         if not active:
             return
         games = [slots[i].game for i in active]
-        trees = create_trees_batched(games, model, device, add_noise=True)
+        trees = create_trees_batched(games, model, device, add_noise=True,
+                                     noise_dist_scale=self.noise_dist_scale)
         for i, tree in zip(active, trees):
             slots[i].tree = tree
 
