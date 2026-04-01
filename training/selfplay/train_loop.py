@@ -545,6 +545,7 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
     total_ploss = 0.0
     total_ml_loss = 0.0
     total_chain_loss = 0.0
+    total_entropy = 0.0
     n_batches = 0
 
     for (planes, visit_dist, value_target,
@@ -584,6 +585,12 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
+        with torch.no_grad():
+            flat = pair_logits.reshape(pair_logits.size(0), -1).float()
+            p = F.softmax(flat, dim=-1)
+            ent = -(p * p.clamp(min=1e-8).log()).sum(dim=-1).mean()
+            total_entropy += ent.item()
+
         total_loss += loss.item()
         total_vloss += vloss.item()
         total_ploss += ploss.item()
@@ -593,7 +600,7 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
 
     d = max(n_batches, 1)
     return (total_loss / d, total_vloss / d, total_ploss / d,
-            total_ml_loss / d, total_chain_loss / d)
+            total_ml_loss / d, total_chain_loss / d, total_entropy / d)
 
 
 # ---------------------------------------------------------------------------
@@ -1078,7 +1085,7 @@ def main():
     use_wandb = (not args.no_wandb) and HAS_WANDB
     if use_wandb:
         # Load or create a stable run ID so restarts resume the same run
-        run_id_path = os.path.join(args.output_dir, "wandb_run_id.txt")
+        run_id_path = os.path.join(args.data_dir, "wandb_run_id.txt")
         run_id = os.environ.get("WANDB_RUN_ID")
         if not run_id and os.path.exists(run_id_path):
             run_id = open(run_id_path).read().strip()
@@ -1151,13 +1158,14 @@ def main():
         else:
             next_game_id = args.batch_size
 
-        model_dtype = next(model.parameters()).dtype
+        model_dtype = torch.bfloat16  # inference runs in bfloat16
         pool = ParallelSelfPlayPool(
             args.batch_size, args.n_sims, args.n_workers, model_dtype)
         pool.start(game_dicts, next_game_id)
 
     try:
-        for round_num in range(start_round, start_round + args.rounds):
+        round_num = start_round
+        while args.rounds is None or round_num < start_round + args.rounds:
             print(f"\n{'='*60}")
             print(f"  ROUND {round_num}")
             print(f"{'='*60}")
@@ -1169,20 +1177,20 @@ def main():
             model.eval()
             model.bfloat16()
 
-            a_win_rate = None
             if use_parallel:
                 target = COLD_START_GAMES if (
                     is_cold_start and round_num == start_round
                 ) else COMPLETED_PER_ROUND
-                examples, draw_rate = pool.generate_round(
-                    model, device,
-                    round_id=round_num,
-                    data_dir=args.data_dir,
-                    late_temperature=args.late_temperature,
-                    draw_penalty=args.draw_penalty,
-                    target=target,
-                    viewer=viewer,
-                )
+                examples, draw_rate, a_win_rate, avg_moves = \
+                    pool.generate_round(
+                        model, device,
+                        round_id=round_num,
+                        data_dir=args.data_dir,
+                        late_temperature=args.late_temperature,
+                        draw_penalty=args.draw_penalty,
+                        target=target,
+                        viewer=viewer,
+                    )
                 # Save examples
                 manager = SelfPlayManager(
                     model, device, data_dir=args.data_dir)
@@ -1197,7 +1205,8 @@ def main():
                     late_temperature=args.late_temperature,
                     draw_penalty=args.draw_penalty,
                 )
-                examples, draw_rate, a_win_rate = manager.generate(round_num)
+                examples, draw_rate, a_win_rate, avg_moves = \
+                    manager.generate(round_num)
                 manager.save_round(examples, round_num, args.data_dir)
 
             model.float()
@@ -1227,11 +1236,11 @@ def main():
                 scaler=scaler,
                 value_weight=args.value_weight,
             )
-            avg_loss, avg_vloss, avg_ploss, avg_ml, avg_chain = losses
+            avg_loss, avg_vloss, avg_ploss, avg_ml, avg_chain, avg_entropy = losses
             t_train = time.time() - t1
             print(f"  Loss: {avg_loss:.4f} (value={avg_vloss:.4f}, "
                   f"policy={avg_ploss:.4f}, ml={avg_ml:.4f}, "
-                  f"chain={avg_chain:.4f})")
+                  f"chain={avg_chain:.4f}, entropy={avg_entropy:.4f})")
 
             # --- 3. Checkpoint ---
             ckpt_path = save_checkpoint(model, optimizer, scaler, round_num,
@@ -1284,15 +1293,16 @@ def main():
                     "policy_loss": avg_ploss,
                     "moves_left_loss": avg_ml,
                     "chain_loss": avg_chain,
+                    "policy_entropy": avg_entropy,
                     "best_win_rate": best_win_rate,
                     "draw_rate": draw_rate,
+                    "a_win_pct": a_win_rate,
+                    "avg_moves": avg_moves,
                     "examples": len(examples),
                     "time_gen": t_gen,
                     "time_train": t_train,
                     "time_eval": t_eval,
                 }
-                if a_win_rate is not None:
-                    log_data["a_win_pct"] = a_win_rate
                 if eval_result is not None:
                     log_data["eval/crossover_time"] = crossover_time
                     log_data["eval/score_low"] = eval_result["score_low"]
@@ -1300,6 +1310,8 @@ def main():
                     log_data["eval/score_high"] = eval_result["score_high"]
                     log_data["eval/win_rate"] = win_rate
                 wandb.log(log_data)
+
+            round_num += 1
     finally:
         if pool is not None:
             pool.shutdown()

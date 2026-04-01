@@ -420,7 +420,8 @@ class SelfPlayManager:
         draw_rate = draws / max(total_games, 1)
         decisive = wins_a + wins_b
         a_win_rate = wins_a / max(decisive, 1)
-        return all_examples, draw_rate, a_win_rate
+        avg_moves = total_moves_in_completed / max(total_games, 1)
+        return all_examples, draw_rate, a_win_rate, avg_moves
 
     def _new_slot(self, game_id: int) -> SelfPlaySlot:
         """Create a new game slot on a toroidal board. First move at center."""

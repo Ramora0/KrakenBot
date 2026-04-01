@@ -1,3 +1,3 @@
 python -m training.distill.train_resnet --amp --epochs 3
 
-python -m training.selfplay.train_loop --resume training/distill/resnet_results/checkpoint.pt --amp --n-workers 12
+python -m training.selfplay.train_loop --resume training/distill/resnet_results/checkpoint.pt --amp
