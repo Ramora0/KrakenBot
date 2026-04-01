@@ -1,7 +1,7 @@
 """MCTS self-play training loop: generate → train → evaluate.
 
 Usage:
-    python -m training.selfplay.train_loop --rounds 10 --amp
+    python -m training.selfplay.train_loop --amp
 """
 
 import argparse
@@ -923,8 +923,8 @@ def save_checkpoint(model, optimizer, scaler, round_num, output_dir,
 def main():
     parser = argparse.ArgumentParser(
         description="MCTS self-play training loop")
-    parser.add_argument("--rounds", type=int, default=10,
-                        help="Number of training rounds")
+    parser.add_argument("--rounds", type=int, default=None,
+                        help="Number of training rounds (default: run indefinitely)")
     parser.add_argument("--batch-size", type=int, default=256,
                         help="Number of parallel games in self-play")
     parser.add_argument("--n-sims", type=int, default=200,
@@ -1035,28 +1035,26 @@ def main():
         crossover_time = ckpt.get("crossover_time", None)
         print(f"Auto-resumed from {ckpt_path} (round {start_round})")
 
+    os.makedirs(args.output_dir, exist_ok=True)
+
     # wandb
     use_wandb = (not args.no_wandb) and HAS_WANDB
     if use_wandb:
-        try:
-            # Load or create a stable run ID so restarts resume the same run
-            run_id_path = os.path.join(args.output_dir, "wandb_run_id.txt")
-            run_id = os.environ.get("WANDB_RUN_ID")
-            if not run_id and os.path.exists(run_id_path):
-                run_id = open(run_id_path).read().strip()
-            wandb.init(
-                project="hex-mcts-selfplay",
-                config=vars(args),
-                name=f"mcts_r{start_round}",
-                id=run_id,
-                resume="allow",
-            )
-            # Save the run ID for future restarts
-            with open(run_id_path, "w") as f:
-                f.write(wandb.run.id)
-        except Exception as e:
-            print(f"WARNING: wandb init failed ({e})")
-            use_wandb = False
+        # Load or create a stable run ID so restarts resume the same run
+        run_id_path = os.path.join(args.output_dir, "wandb_run_id.txt")
+        run_id = os.environ.get("WANDB_RUN_ID")
+        if not run_id and os.path.exists(run_id_path):
+            run_id = open(run_id_path).read().strip()
+        wandb.init(
+            project="hex-mcts-selfplay",
+            config=vars(args),
+            name=f"mcts_r{start_round}",
+            id=run_id,
+            resume="allow",
+        )
+        # Save the run ID for future restarts
+        with open(run_id_path, "w") as f:
+            f.write(wandb.run.id)
 
     # Game viewer
     viewer = None
@@ -1066,7 +1064,6 @@ def main():
         viewer.start()
 
     os.makedirs(args.data_dir, exist_ok=True)
-    os.makedirs(args.output_dir, exist_ok=True)
 
     # Run evaluation immediately if requested
     if args.evaluate:
@@ -1093,7 +1090,8 @@ def main():
                 "round": start_round - 1,
             }, commit=True)
 
-    for round_num in range(start_round, start_round + args.rounds):
+    round_num = start_round
+    while args.rounds is None or round_num < start_round + args.rounds:
         print(f"\n{'='*60}")
         print(f"  ROUND {round_num}")
         print(f"{'='*60}")
@@ -1110,7 +1108,7 @@ def main():
                         and not args.no_parallel)
         if use_parallel:
             from training.selfplay.parallel_selfplay import generate_parallel
-            examples, draw_rate = generate_parallel(
+            examples, draw_rate, a_win_rate = generate_parallel(
                 model, device,
                 batch_size=args.batch_size,
                 n_sims=args.n_sims,
@@ -1138,7 +1136,7 @@ def main():
                 late_temperature=args.late_temperature,
                 draw_penalty=args.draw_penalty,
             )
-            examples, draw_rate = manager.generate(round_num)
+            examples, draw_rate, a_win_rate = manager.generate(round_num)
             manager.save_round(examples, round_num, args.data_dir)
 
         model.float()
@@ -1226,6 +1224,7 @@ def main():
                 "chain_loss": avg_chain,
                 "best_win_rate": best_win_rate,
                 "draw_rate": draw_rate,
+                "a_win_pct": a_win_rate,
                 "examples": len(examples),
                 "time_gen": t_gen,
                 "time_train": t_train,
@@ -1238,6 +1237,8 @@ def main():
                 log_data["eval/score_high"] = eval_result["score_high"]
                 log_data["eval/win_rate"] = win_rate
             wandb.log(log_data)
+
+        round_num += 1
 
     print(f"\n{'='*60}")
     if crossover_time is not None:

@@ -522,7 +522,7 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
     all_examples = []
     games_completed = 0
     wins_a = wins_b = draws = 0
-    total_moves = 0
+    total_turns = 0
 
     pbar = tqdm(total=target, desc="Games", unit="game", position=0)
     pos_bar = tqdm(desc="Positions", unit="pos", position=1)
@@ -596,12 +596,12 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
                     else:
                         draws += 1
                     games_completed += 1
-                    total_moves += c['move_count']
+                    total_turns += c['turn_number']
                     pbar.update(1)
                     n = wins_a + wins_b + draws
                     pbar.set_postfix(
                         A=wins_a, B=wins_b, draw=draws,
-                        avg_moves=f"{total_moves/n:.0f}")
+                        avg_turns=f"{total_turns/n:.0f}")
 
                     if viewer:
                         viewer.add_finished_data(
@@ -660,7 +660,9 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
 
     total_games = wins_a + wins_b + draws
     draw_rate = draws / max(total_games, 1)
-    return all_examples, draw_rate
+    decisive = wins_a + wins_b
+    a_win_rate = wins_a / max(decisive, 1)
+    return all_examples, draw_rate, a_win_rate
 
 
 def _drain_errors(queue):

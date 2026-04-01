@@ -1,0 +1,7 @@
+pyproject.toml
+setup.py
+cpp/ai_cpp.cpp
+hex_cpp_bot.egg-info/PKG-INFO
+hex_cpp_bot.egg-info/SOURCES.txt
+hex_cpp_bot.egg-info/dependency_links.txt
+hex_cpp_bot.egg-info/top_level.txt

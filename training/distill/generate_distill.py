@@ -21,6 +21,7 @@ import json
 import os
 import pickle
 import random
+import signal
 import sys
 import time
 from multiprocessing import Pool
@@ -31,6 +32,7 @@ from game import HexGame, Player, HEX_DIRECTIONS
 
 SCORE_SCALE = 20_000
 MAX_MOVES = 200
+MOVE_WALL_TIMEOUT = 10.0  # seconds; skip game if a single get_move exceeds this
 MAX_BOARD_SPAN = 19
 _WIN_LENGTH = 6
 
@@ -182,6 +184,17 @@ def _play_one_game(args):
     Returns (examples, total_moves, finish_type) where finish_type is
     'single' (stone 1 won), 'double' (stone 2 won), or None (discarded).
     """
+    try:
+        return _play_one_game_inner(args)
+    except Exception as e:
+        game_id = args[6]
+        stones = len(args[0])
+        print(f"[ERROR] game {game_id} ({stones} stones): {type(e).__name__}: {e}",
+              flush=True)
+        return None, 0, None
+
+
+def _play_one_game_inner(args):
     board, cp, _human_gid, time_limit, time_jitter, pattern_path, game_id, seed = args
 
     rng = random.Random(seed)
@@ -211,7 +224,15 @@ def _play_one_game(args):
         bot = bots[player]
 
         board_snap = dict(game.board)
+        t_move = time.time()
         moves = list(bot.get_move(game))
+        elapsed = time.time() - t_move
+        if elapsed > MOVE_WALL_TIMEOUT:
+            print(f"[SLOW] game {game_id}: get_move took {elapsed:.1f}s "
+                  f"(limit={bot.time_limit:.3f}s, depth={bot.last_depth}, "
+                  f"nodes={bot._nodes}, stones={len(game.board)}, "
+                  f"move#{total_moves})", flush=True)
+            return None, 0, None
         eval_score = bot.last_score / SCORE_SCALE
 
         moves_played = []
@@ -342,43 +363,48 @@ def main():
     games_since_save = 0
     t0 = time.time()
 
+    pool = Pool(workers)
     try:
-        with Pool(workers) as pool:
-            pbar = tqdm(pool.imap(_play_one_game, tasks, chunksize=4),
-                        total=len(tasks), desc="Games", unit="game")
-            for examples, move_count, finish_type in pbar:
-                games_completed += 1
+        pbar = tqdm(pool.imap_unordered(_play_one_game, tasks, chunksize=1),
+                    total=len(tasks), desc="Games", unit="game")
+        for examples, move_count, finish_type in pbar:
+            games_completed += 1
 
-                if examples is None:
-                    games_discarded += 1
+            if examples is None:
+                games_discarded += 1
+            else:
+                all_examples.extend(examples)
+                total_game_moves += move_count
+                ws = examples[0]["win_score"]
+                if ws > 0:
+                    wins += 1
+                elif ws < 0:
+                    losses += 1
                 else:
-                    all_examples.extend(examples)
-                    total_game_moves += move_count
-                    ws = examples[0]["win_score"]
-                    if ws > 0:
-                        wins += 1
-                    elif ws < 0:
-                        losses += 1
-                    else:
-                        draws += 1
-                    if finish_type == 'single':
-                        single_finishes += 1
-                    elif finish_type == 'double':
-                        double_finishes += 1
+                    draws += 1
+                if finish_type == 'single':
+                    single_finishes += 1
+                elif finish_type == 'double':
+                    double_finishes += 1
 
-                kept = games_completed - games_discarded
-                avg_moves = total_game_moves / kept if kept else 0
-                pbar.set_postfix(W=wins, L=losses, D=draws,
-                                 s1=single_finishes, s2=double_finishes,
-                                 avg_mv=f"{avg_moves:.0f}")
+            kept = games_completed - games_discarded
+            avg_moves = total_game_moves / kept if kept else 0
+            pbar.set_postfix(W=wins, L=losses, D=draws,
+                             s1=single_finishes, s2=double_finishes,
+                             avg_mv=f"{avg_moves:.0f}")
 
-                games_since_save += 1
-                if games_since_save >= args.save_interval:
-                    _save_parquet(all_examples, args.output)
-                    games_since_save = 0
+            games_since_save += 1
+            if games_since_save >= args.save_interval:
+                _save_parquet(all_examples, args.output)
+                games_since_save = 0
 
     except KeyboardInterrupt:
         print(f"\nInterrupted after {games_completed} games! Saving...")
+    except Exception as e:
+        print(f"\nError after {games_completed} games: {e}\nSaving...")
+    finally:
+        pool.terminate()
+        pool.join()
 
     elapsed = time.time() - t0
 
