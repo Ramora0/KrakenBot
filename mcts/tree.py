@@ -25,12 +25,12 @@ from model.resnet import BOARD_SIZE
 # Constants
 # ---------------------------------------------------------------------------
 
-PUCT_C = 2.0            # tighter exploration for 200-sim budget
+PUCT_C = 0.8             # low exploration for tactical connect-6
 EXPAND_VISITS = 1       # expand on first visit (standard AlphaZero)
 MAX_DEPTH = 50          # safety limit on pair-move depth
 NON_ROOT_TOP_K = 50     # candidate pairs for non-root flat selection
-DIRICHLET_ALPHA = 0.02  # ~10/N_legal, Connect-6 convention for ~600 candidates
-DIRICHLET_FRAC = 0.25   # standard AlphaZero/gomoku noise weight
+DIRICHLET_ALPHA = 0.06  # slightly higher for more uniform noise across candidates
+DIRICHLET_FRAC = 0.10   # reduced from 0.25; high noise causes missed defenses
 N_CELLS = BOARD_SIZE * BOARD_SIZE
 _ALL_CELLS = frozenset((q, r) for q in range(BOARD_SIZE) for r in range(BOARD_SIZE))
 

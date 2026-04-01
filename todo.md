@@ -4,7 +4,4 @@
 - [ ] Evaluate against weak minimax
 
 # Speedupa
-- [ ] Resuming games takes forever
-- [ ] Still CPU bound
-- [ ] Reduce memory for bigger batch size
-- [ ] Report A vs B wins
+- [ ] TensorRT or smth
