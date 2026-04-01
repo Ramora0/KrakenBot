@@ -3,7 +3,7 @@
 
 from libc.math cimport sqrt
 
-cdef double PUCT_C = 2.0
+cdef double PUCT_C = 0.8
 
 
 def puct_select(node, double c=PUCT_C):
