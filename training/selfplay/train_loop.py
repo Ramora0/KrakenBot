@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
-from game import HexGame, HEX_DIRECTIONS, Player
+from game import HexGame, ToroidalHexGame, TORUS_SIZE, HEX_DIRECTIONS, Player
 from model.resnet import BOARD_SIZE, HexResNet, board_to_planes_torus
 from model.symmetry import (
     apply_symmetry_planes, apply_symmetry_chain, PERMS, N as SYM_N,
@@ -935,11 +935,260 @@ def evaluate_crossover(model, device, n_games=100, n_sims=200,
 
 
 # ---------------------------------------------------------------------------
+# Anchor-based Elo evaluation
+# ---------------------------------------------------------------------------
+
+def compute_elo(num_graduations: int, score: float) -> float:
+    """Cumulative Elo from graduations and current anchor win rate."""
+    score = max(0.001, min(0.999, score))
+    return 200 * num_graduations + 400 * math.log10(score / (1 - score))
+
+
+def _run_batched_sims(
+    indices: list[int],
+    games: list,
+    trees: list,
+    model: torch.nn.Module,
+    device: torch.device,
+    n_sims: int,
+):
+    """Run n_sims MCTS simulations for a group of games, batching NN evals."""
+    from mcts.tree import select_leaf, expand_and_backprop, maybe_expand_leaf
+
+    B = len(indices)
+    if B == 0:
+        return
+
+    model_dtype = next(model.parameters()).dtype
+    buf = torch.zeros(B, 2, BOARD_SIZE, BOARD_SIZE, dtype=model_dtype)
+
+    for _sim in range(n_sims):
+        # Select leaves for all games in group
+        leaves = [select_leaf(trees[indices[j]], games[indices[j]])
+                  for j in range(B)]
+
+        # Partition: terminal vs needs-eval
+        eval_list = []  # (position_in_group, leaf)
+        for j, leaf in enumerate(leaves):
+            if leaf.is_terminal or not leaf.deltas:
+                expand_and_backprop(trees[indices[j]], leaf, 0.0)
+            else:
+                eval_list.append((j, leaf))
+
+        if not eval_list:
+            continue
+
+        # Build batch tensor from root_planes + deltas
+        ne = len(eval_list)
+        for k, (j, leaf) in enumerate(eval_list):
+            tree = trees[indices[j]]
+            rp = tree.root_planes
+            if leaf.player_flipped:
+                buf[k, 0].copy_(rp[1])
+                buf[k, 1].copy_(rp[0])
+            else:
+                buf[k].copy_(rp)
+            for gq, gr, ch in leaf.deltas:
+                actual_ch = (1 - ch) if leaf.player_flipped else ch
+                buf[k, actual_ch, gq, gr] = 1.0
+
+        # Batched forward pass
+        x = buf[:ne].to(device)
+        values, pair_logits, _, _ = model(x)
+
+        # Collect expansion data for leaves that need it
+        need_expand = [k for k, (j, leaf) in enumerate(eval_list)
+                       if leaf.needs_expansion]
+        expand_data = {}
+        if need_expand:
+            ne_idx = torch.tensor(need_expand, dtype=torch.long)
+            exp_logits = pair_logits[ne_idx]
+            flat = exp_logits.reshape(len(need_expand), -1)
+            top_raw, top_idxs = flat.topk(min(200, flat.shape[-1]), dim=-1)
+            top_vals = F.softmax(top_raw, dim=-1)
+            marg_logits = exp_logits.logsumexp(dim=-1)
+            marginals = F.softmax(marg_logits, dim=-1)
+            marginals_cpu = marginals.cpu()
+            top_idxs_cpu = top_idxs.cpu()
+            top_vals_cpu = top_vals.cpu()
+            for k_idx, k in enumerate(need_expand):
+                expand_data[k] = (
+                    marginals_cpu[k_idx], top_idxs_cpu[k_idx],
+                    top_vals_cpu[k_idx])
+
+        # Backprop and expand
+        values_cpu = values.cpu()
+        for k, (j, leaf) in enumerate(eval_list):
+            nn_val = values_cpu[k].item()
+            expand_and_backprop(trees[indices[j]], leaf, nn_val)
+            if k in expand_data:
+                mg, ti, tv = expand_data[k]
+                maybe_expand_leaf(trees[indices[j]], leaf, mg, ti, tv,
+                                  nn_value=nn_val)
+
+        # Reset buf entries that had deltas applied (restore for next sim)
+        for k, (j, leaf) in enumerate(eval_list):
+            rp = trees[indices[j]].root_planes
+            for gq, gr, ch in leaf.deltas:
+                actual_ch = (1 - ch) if leaf.player_flipped else ch
+                # Pre-delta value: buf[k, actual_ch] came from rp[ch]
+                # (straight copy or flipped copy)
+                buf[k, actual_ch, gq, gr] = rp[ch, gq, gr]
+
+
+@torch.no_grad()
+def evaluate_vs_anchor(
+    current_model,
+    anchor_model,
+    device: torch.device,
+    n_games: int = 256,
+    n_sims: int = 200,
+    temperature: float = 0.1,
+) -> dict:
+    """Play current model vs anchor model, both using MCTS on toroidal boards.
+
+    Games split evenly by side: first half current=A, second half current=B.
+    Returns dict with wins, losses, draws, score.
+    """
+    from mcts.tree import (
+        create_trees_batched, select_move_pair, select_single_move,
+    )
+
+    current_model.eval()
+    anchor_model.eval()
+
+    CENTER = TORUS_SIZE // 2
+    games = []
+    current_side = []
+    for i in range(n_games):
+        g = ToroidalHexGame()
+        g.make_move(CENTER, CENTER)  # first move always at center
+        games.append(g)
+        current_side.append(Player.A if i < n_games // 2 else Player.B)
+
+    active = set(range(n_games))
+    trees = [None] * n_games
+    wins = losses = draws = 0
+    MAX_MOVES = 150
+
+    pbar = tqdm(total=n_games, desc="Anchor eval", unit="game")
+
+    while active:
+        # Partition active games by whose turn it is
+        current_idx = []
+        anchor_idx = []
+        for i in sorted(active):
+            if games[i].game_over or games[i].move_count >= MAX_MOVES:
+                continue
+            if games[i].current_player == current_side[i]:
+                current_idx.append(i)
+            else:
+                anchor_idx.append(i)
+
+        for group_idx, group_model in [
+            (current_idx, current_model),
+            (anchor_idx, anchor_model),
+        ]:
+            if not group_idx:
+                continue
+
+            # Batch tree creation
+            group_games = [games[i] for i in group_idx]
+            group_trees = create_trees_batched(
+                group_games, group_model, device, add_noise=False)
+            for i, tree in zip(group_idx, group_trees):
+                trees[i] = tree
+
+            # Run batched simulations
+            _run_batched_sims(
+                group_idx, games, trees, group_model, device, n_sims)
+
+            # Select moves and advance games
+            for i in group_idx:
+                if games[i].moves_left_in_turn == 1:
+                    gq, gr = select_single_move(trees[i])
+                    moves = [(gq, gr)]
+                else:
+                    (g1q, g1r), (g2q, g2r) = select_move_pair(
+                        trees[i], temperature=temperature)
+                    moves = [(g1q, g1r), (g2q, g2r)]
+
+                for q, r in moves:
+                    if not games[i].game_over:
+                        games[i].make_move(q, r)
+
+                trees[i] = None  # force tree recreation next turn
+
+        # Check for finished games
+        for i in list(active):
+            if games[i].game_over or games[i].move_count >= MAX_MOVES:
+                active.discard(i)
+                w, l, d = _eval_result(games[i], current_side[i])
+                wins += w; losses += l; draws += d
+                pbar.update(1)
+
+    pbar.close()
+    total = max(wins + losses + draws, 1)
+    score = (wins + 0.5 * draws) / total
+    print(f"  vs Anchor: {wins}W / {losses}L / {draws}D "
+          f"= {100 * score:.1f}% score")
+    return {"wins": wins, "losses": losses, "draws": draws, "score": score}
+
+
+# ---------------------------------------------------------------------------
+# Anchor checkpoint management
+# ---------------------------------------------------------------------------
+
+def save_anchor(model, output_dir, num_graduations, anchor_round):
+    """Atomically save anchor checkpoint."""
+    os.makedirs(output_dir, exist_ok=True)
+    ckpt = {
+        "model_state_dict": model.state_dict(),
+        "num_graduations": num_graduations,
+        "anchor_round": anchor_round,
+    }
+    path = os.path.join(output_dir, "anchor.pt")
+    tmp = path + ".tmp"
+    torch.save(ckpt, tmp)
+    os.replace(tmp, path)
+    print(f"Anchor saved: {path} (round {anchor_round})")
+
+
+def load_anchor_model(model, args, device, num_graduations, anchor_round):
+    """Load anchor model from anchor.pt, or create from current model.
+
+    Returns (anchor_model, num_graduations, anchor_round).
+    """
+    anchor_path = os.path.join(args.output_dir, "anchor.pt")
+    anchor_model = HexResNet(
+        num_blocks=args.num_blocks, num_filters=args.num_filters
+    ).to(device)
+
+    if os.path.exists(anchor_path):
+        ckpt = torch.load(anchor_path, map_location=device, weights_only=False)
+        anchor_model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        num_graduations = ckpt.get("num_graduations", num_graduations)
+        anchor_round = ckpt.get("anchor_round", anchor_round)
+        print(f"Loaded anchor from {anchor_path} "
+              f"(round {anchor_round}, graduations={num_graduations})")
+    else:
+        # No anchor exists — save current model as initial anchor
+        anchor_model.load_state_dict(model.state_dict())
+        save_anchor(model, args.output_dir, num_graduations, anchor_round)
+        print(f"Created initial anchor from current model")
+
+    anchor_model.eval()
+    return anchor_model, num_graduations, anchor_round
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint management
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(model, optimizer, scaler, round_num, output_dir,
-                    best_win_rate=0.0, crossover_time=None):
+                    best_win_rate=0.0, crossover_time=None,
+                    num_graduations=0, anchor_round=None,
+                    save_numbered=True):
     """Save model checkpoint atomically."""
     os.makedirs(output_dir, exist_ok=True)
     ckpt = {
@@ -949,20 +1198,27 @@ def save_checkpoint(model, optimizer, scaler, round_num, output_dir,
         "scaler_state_dict": scaler.state_dict() if scaler else None,
         "best_win_rate": best_win_rate,
         "crossover_time": crossover_time,
+        "num_graduations": num_graduations,
+        "anchor_round": anchor_round,
     }
-    path = os.path.join(output_dir, f"round_{round_num}.pt")
-    tmp = path + ".tmp"
-    torch.save(ckpt, tmp)
-    os.replace(tmp, path)
 
-    # Also save as best.pt
+    # Save numbered checkpoint only when requested (e.g. every 10 rounds)
+    if save_numbered:
+        path = os.path.join(output_dir, f"round_{round_num}.pt")
+        tmp = path + ".tmp"
+        torch.save(ckpt, tmp)
+        os.replace(tmp, path)
+        print(f"Checkpoint saved: {path}")
+    else:
+        path = None
+
+    # Always save best.pt for crash recovery
     best_path = os.path.join(output_dir, "best.pt")
     tmp = best_path + ".tmp"
     torch.save(ckpt, tmp)
     os.replace(tmp, best_path)
 
-    print(f"Checkpoint saved: {path}")
-    return path
+    return path or best_path
 
 
 # ---------------------------------------------------------------------------
@@ -982,8 +1238,8 @@ def main():
                         help="Training batch size")
     parser.add_argument("--lr", type=float, default=0.005,
                         help="Learning rate")
-    parser.add_argument("--eval-games", type=int, default=100,
-                        help="Evaluation games per round")
+    parser.add_argument("--eval-games", type=int, default=256,
+                        help="Evaluation games per anchor eval")
     parser.add_argument("--eval-sims", type=int, default=200,
                         help="MCTS sims for evaluation bot")
     parser.add_argument("--minimax-time", type=float, default=0.001,
@@ -1007,7 +1263,9 @@ def main():
     parser.add_argument("--num-blocks", type=int, default=10)
     parser.add_argument("--num-filters", type=int, default=128)
     parser.add_argument("--eval-every", type=int, default=10,
-                        help="Evaluate vs minimax every N rounds (default: 10)")
+                        help="Evaluate vs anchor every N rounds (default: 10)")
+    parser.add_argument("--graduation-threshold", type=float, default=0.76,
+                        help="Score threshold to graduate anchor (default: 0.76)")
     parser.add_argument("--no-viewer", action="store_true",
                         help="Disable live game viewer")
     parser.add_argument("--viewer-port", type=int, default=8765,
@@ -1071,6 +1329,8 @@ def main():
     start_round = 0
     best_win_rate = 0.0
     crossover_time = None
+    num_graduations = 0
+    anchor_round = None
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
@@ -1083,6 +1343,8 @@ def main():
             start_round = ckpt.get("round", 0) + 1
             best_win_rate = ckpt.get("best_win_rate", 0.0)
             crossover_time = ckpt.get("crossover_time", None)
+            num_graduations = ckpt.get("num_graduations", 0)
+            anchor_round = ckpt.get("anchor_round", None)
             print(f"Resumed from {args.resume} (round {start_round})")
         else:
             print(f"Loaded model weights from {args.resume} (fresh optimizer)")
@@ -1097,10 +1359,18 @@ def main():
         start_round = ckpt.get("round", 0) + 1
         best_win_rate = ckpt.get("best_win_rate", 0.0)
         crossover_time = ckpt.get("crossover_time", None)
+        num_graduations = ckpt.get("num_graduations", 0)
+        anchor_round = ckpt.get("anchor_round", None)
         print(f"Auto-resumed from {ckpt_path} (round {start_round})")
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.data_dir, exist_ok=True)
+
+    # Load or create anchor model for evaluation
+    anchor_model = None
+    if not args.no_eval:
+        anchor_model, num_graduations, anchor_round = load_anchor_model(
+            model, args, device, num_graduations, anchor_round)
 
     # wandb
     use_wandb = (not args.no_wandb) and HAS_WANDB
@@ -1129,27 +1399,24 @@ def main():
         viewer.start()
 
     # Run evaluation immediately if requested
-    if args.evaluate:
-        center = crossover_time if crossover_time is not None else args.minimax_time
-        print(f"\n--- Startup evaluation: {args.eval_games} games, "
-              f"center={center:.4f}s ---")
+    if args.evaluate and anchor_model is not None:
+        print(f"\n--- Startup anchor evaluation: {args.eval_games} games, "
+              f"{args.eval_sims} sims ---")
         model.eval()
-        eval_result = evaluate_crossover(
-            model, device, n_games=args.eval_games,
-            n_sims=args.eval_sims, center=center,
+        eval_result = evaluate_vs_anchor(
+            model, anchor_model, device,
+            n_games=args.eval_games, n_sims=args.eval_sims,
         )
-        crossover_time = eval_result["crossover_time"]
-        win_rate = eval_result["score_mid"]
-        if win_rate > best_win_rate:
-            best_win_rate = win_rate
-            print(f"  New best win rate at mid time: {100 * best_win_rate:.1f}%")
+        score = eval_result["score"]
+        cumulative_elo = compute_elo(num_graduations, score)
+        print(f"  Score: {100*score:.1f}% | Elo: {cumulative_elo:.0f} "
+              f"(graduations={num_graduations})")
         if use_wandb:
             wandb.log({
-                "eval/crossover_time": crossover_time,
-                "eval/score_low": eval_result["score_low"],
-                "eval/score_mid": eval_result["score_mid"],
-                "eval/score_high": eval_result["score_high"],
-                "eval/win_rate": win_rate,
+                "eval/score": score,
+                "eval/elo": cumulative_elo,
+                "eval/num_graduations": num_graduations,
+                "eval/anchor_round": anchor_round,
                 "round": start_round - 1,
             }, commit=True)
 
@@ -1262,32 +1529,51 @@ def main():
                   f"chain={avg_chain:.4f}, entropy={avg_entropy:.4f})")
 
             # --- 3. Checkpoint ---
-            ckpt_path = save_checkpoint(model, optimizer, scaler, round_num,
-                                        args.output_dir, best_win_rate,
-                                        crossover_time=crossover_time)
+            is_eval_round = (
+                not args.no_eval
+                and (round_num + 1) % args.eval_every == 0
+            )
+            ckpt_path = save_checkpoint(
+                model, optimizer, scaler, round_num,
+                args.output_dir, best_win_rate,
+                crossover_time=crossover_time,
+                num_graduations=num_graduations,
+                anchor_round=anchor_round,
+                save_numbered=is_eval_round)
 
-            # --- 4. Evaluate (every eval_every rounds) ---
+            # --- 4. Evaluate vs anchor (every eval_every rounds) ---
             eval_result = None
-            win_rate = None
+            cumulative_elo = None
             t_eval = 0.0
-            if not args.no_eval and (round_num + 1) % args.eval_every == 0:
-                center = (crossover_time if crossover_time is not None
-                          else args.minimax_time)
-                print(f"\n--- Evaluation: {args.eval_games} games, "
-                      f"center={center:.4f}s ---")
+            if is_eval_round and anchor_model is not None:
+                print(f"\n--- Anchor Evaluation: {args.eval_games} games, "
+                      f"{args.eval_sims} sims ---")
                 t2 = time.time()
-                eval_result = evaluate_crossover(
-                    model, device, n_games=args.eval_games,
-                    n_sims=args.eval_sims, center=center,
+                model.eval()
+                eval_result = evaluate_vs_anchor(
+                    model, anchor_model, device,
+                    n_games=args.eval_games,
+                    n_sims=args.eval_sims,
                 )
                 t_eval = time.time() - t2
-                crossover_time = eval_result["crossover_time"]
-                win_rate = eval_result["score_mid"]
 
-                if win_rate > best_win_rate:
-                    best_win_rate = win_rate
-                    print(f"  New best win rate at mid time: "
-                          f"{100 * best_win_rate:.1f}%")
+                score = eval_result["score"]
+                cumulative_elo = compute_elo(num_graduations, score)
+                print(f"  Score: {100*score:.1f}% | Elo: {cumulative_elo:.0f} "
+                      f"(graduations={num_graduations})")
+
+                # Graduation check
+                if score >= args.graduation_threshold:
+                    num_graduations += 1
+                    anchor_round = round_num
+                    save_anchor(model, args.output_dir,
+                                num_graduations, anchor_round)
+                    anchor_model.load_state_dict(model.state_dict())
+                    anchor_model.eval()
+                    cumulative_elo = compute_elo(num_graduations, 0.5)
+                    print(f"  *** GRADUATED! New anchor = round {round_num}, "
+                          f"graduations={num_graduations}, "
+                          f"Elo={cumulative_elo:.0f} ***")
 
             t_total = time.time() - t0
 
@@ -1298,10 +1584,9 @@ def main():
             print(f"    Far moves (>dist 2): {far_pct:.1f}%")
             print(f"    Loss: {avg_loss:.4f}")
             if eval_result is not None:
-                print(f"    Crossover time: {crossover_time:.4f}s")
-                print(f"    Scores: low={eval_result['score_low']:.2f} "
-                      f"mid={eval_result['score_mid']:.2f} "
-                      f"high={eval_result['score_high']:.2f}")
+                print(f"    Elo: {cumulative_elo:.0f} "
+                      f"(score={100*eval_result['score']:.1f}%, "
+                      f"graduations={num_graduations})")
             print(f"    Time: {t_gen:.0f}s gen + {t_train:.0f}s train "
                   f"+ {t_eval:.0f}s eval = {t_total:.0f}s total")
 
@@ -1325,11 +1610,13 @@ def main():
                     "time_eval": t_eval,
                 }
                 if eval_result is not None:
-                    log_data["eval/crossover_time"] = crossover_time
-                    log_data["eval/score_low"] = eval_result["score_low"]
-                    log_data["eval/score_mid"] = eval_result["score_mid"]
-                    log_data["eval/score_high"] = eval_result["score_high"]
-                    log_data["eval/win_rate"] = win_rate
+                    log_data["eval/score"] = eval_result["score"]
+                    log_data["eval/elo"] = cumulative_elo
+                    log_data["eval/num_graduations"] = num_graduations
+                    log_data["eval/anchor_round"] = anchor_round
+                    log_data["eval/wins"] = eval_result["wins"]
+                    log_data["eval/losses"] = eval_result["losses"]
+                    log_data["eval/draws"] = eval_result["draws"]
                 wandb.log(log_data)
 
             round_num += 1
@@ -1337,11 +1624,10 @@ def main():
         if pool is not None:
             pool.shutdown()
 
+    elo_str = f"Elo: {cumulative_elo:.0f}" if cumulative_elo is not None else ""
     print(f"\n{'='*60}")
-    if crossover_time is not None:
-        print(f"  Training complete. Crossover time: {crossover_time:.4f}s")
-    else:
-        print(f"  Training complete. Best win rate: {100 * best_win_rate:.1f}%")
+    print(f"  Training complete. {elo_str} "
+          f"(graduations={num_graduations})")
     print(f"{'='*60}")
 
     if use_wandb:
