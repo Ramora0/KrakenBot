@@ -39,7 +39,7 @@ _ALL_CELLS = frozenset((q, r) for q in range(BOARD_SIZE) for r in range(BOARD_SI
 # existing stone.  Starts at 2 (matching minimax teacher) and ramps up
 # over self-play rounds so the model gradually learns longer-range play.
 DEFAULT_MAX_CAND_DIST = None  # None = no limit (legacy behaviour)
-DIST_GATE_BASE = 2           # starting max distance
+DIST_GATE_BASE = 8           # starting max distance
 DIST_GATE_RAMP_ROUNDS = 50   # rounds per +1 distance step
 
 # ---------------------------------------------------------------------------
@@ -639,6 +639,10 @@ def compute_max_cand_dist(round_num: int) -> tuple[int | None, float]:
     """
     d = DIST_GATE_BASE + round_num // DIST_GATE_RAMP_ROUNDS
     frac = (round_num % DIST_GATE_RAMP_ROUNDS) / DIST_GATE_RAMP_ROUNDS
+    # Cap at DIST_GATE_BASE (no ramp beyond it)
+    if d > DIST_GATE_BASE:
+        d = DIST_GATE_BASE
+        frac = 0.0
     if d >= BOARD_SIZE // 2:
         return None, 0.0  # no limit — full board
     return d, frac

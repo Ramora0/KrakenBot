@@ -261,8 +261,9 @@ def draw_board(screen, game, visible_cells, hover_hex, hex_size, ox, oy, fonts,
         screen.blit(moves_surf, moves_surf.get_rect(centerx=WINDOW_WIDTH // 2, y=55))
 
     if ai_stats:
-        sims, = ai_stats
-        ai_info = font_sm.render(f"AI: {sims} sims", True, SUBTLE_TEXT)
+        sims, value = ai_stats
+        ai_info = font_sm.render(
+            f"AI: {sims} sims  |  value: {value:+.3f}", True, SUBTLE_TEXT)
         screen.blit(ai_info, ai_info.get_rect(centerx=WINDOW_WIDTH // 2, y=WINDOW_HEIGHT - 50))
 
     # Bottom instructions per mode
@@ -300,6 +301,9 @@ def main():
                         help="Pre-load moves as 'q1,r1 q2,r2 ...'")
     parser.add_argument("--torus", action="store_true",
                         help="Play on 25x25 toroidal grid instead of infinite")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Device for inference (cuda, mps, cpu). "
+                             "Default: auto-detect")
     args = parser.parse_args()
 
     # Resolve checkpoint path
@@ -316,7 +320,8 @@ def main():
     print(f"Loading checkpoint: {args.checkpoint}")
 
     from mcts_bot import MCTSBot
-    ai = MCTSBot(model_path=args.checkpoint, n_sims=args.n_sims)
+    ai = MCTSBot(model_path=args.checkpoint, n_sims=args.n_sims,
+                  device=args.device)
     print(f"MCTSBot ready ({args.n_sims} sims, device={ai.device})")
 
     game_cls = ToroidalHexGame if args.torus else HexGame
@@ -563,7 +568,7 @@ def main():
                     move_history = move_history[:history_pos]
                     move_history.append((q, r))
                     history_pos = len(move_history)
-            ai_stats = (ai.n_sims,)
+            ai_stats = (ai.n_sims, ai.last_root_value)
             last_ai_time = pygame.time.get_ticks()
 
         draw_board(screen, game, visible_cells, hover_hex, hex_size, ox, oy, fonts,

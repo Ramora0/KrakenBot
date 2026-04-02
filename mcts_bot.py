@@ -35,7 +35,12 @@ class MCTSBot(Bot):
         if model_path is None:
             model_path = _DEFAULT_MODEL_PATH
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
         self.device = torch.device(device)
 
         ckpt = torch.load(model_path, map_location=self.device,
@@ -122,6 +127,8 @@ class MCTSBot(Bot):
                         nn_value=nn_val)
 
                 self._nodes += 1
+
+        self.last_root_value = tree.root_value
 
         # Restore circular padding if we switched
         if not is_torus:
