@@ -67,13 +67,13 @@ from model.resnet import BOARD_SIZE
 # Constants
 # ---------------------------------------------------------------------------
 
-PUCT_C = 0.8             # low exploration for tactical connect-6
+PUCT_C = 1.0             # standard exploration constant
 FPU_REDUCTION = 0.25     # parent-relative first play urgency (KataGo-style)
 EXPAND_VISITS = 1       # expand on first visit (standard AlphaZero)
 MAX_DEPTH = 50          # safety limit on pair-move depth
 NON_ROOT_TOP_K = 50     # candidate pairs for non-root flat selection
-DIRICHLET_ALPHA = 0.06  # slightly higher for more uniform noise across candidates
-DIRICHLET_FRAC = 0.10   # reduced from 0.25; high noise causes missed defenses
+DIRICHLET_ALPHA = 0.0   # unused; alpha is always 10/n
+DIRICHLET_FRAC = 0.25   # standard AlphaZero noise fraction
 N_CELLS = BOARD_SIZE * BOARD_SIZE
 _ALL_CELLS = frozenset((q, r) for q in range(BOARD_SIZE) for r in range(BOARD_SIZE))
 
@@ -470,7 +470,7 @@ def _add_exploration_noise(node: MCTSNode, alpha: float | None = None,
         return
     n = node.n
     if alpha is None:
-        alpha = max(DIRICHLET_ALPHA, 10.0 / n)
+        alpha = 10.0 / n
     dirichlet = np.random.dirichlet([alpha] * n)
     priors = node.priors
 
