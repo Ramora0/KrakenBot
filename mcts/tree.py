@@ -77,12 +77,9 @@ DIRICHLET_FRAC = 0.25   # standard AlphaZero noise fraction
 N_CELLS = BOARD_SIZE * BOARD_SIZE
 _ALL_CELLS = frozenset((q, r) for q in range(BOARD_SIZE) for r in range(BOARD_SIZE))
 
-# Distance gating: candidate cells must be within max_cand_dist of an
-# existing stone.  Starts at 2 (matching minimax teacher) and ramps up
-# over self-play rounds so the model gradually learns longer-range play.
-DEFAULT_MAX_CAND_DIST = None  # None = no limit (legacy behaviour)
-DIST_GATE_BASE = 8           # starting max distance
-DIST_GATE_RAMP_ROUNDS = 50   # rounds per +1 distance step
+# Distance gating: candidate cells must be within MAX_CAND_DIST of an
+# existing stone.  Cells beyond this radius are treated as non-existent.
+MAX_CAND_DIST = 8
 
 # ---------------------------------------------------------------------------
 # Precomputed neighbor table (built once at import time)
@@ -125,44 +122,6 @@ def _build_neighbor_table():
 
 
 _NEIGHBORS_WITHIN = _build_neighbor_table()
-
-
-# ---------------------------------------------------------------------------
-# Vectorized distance computation (replaces per-cell Python loop)
-# ---------------------------------------------------------------------------
-
-def _build_all_pairwise_distances():
-    """Precompute [N_CELLS, N_CELLS] hex distance matrix (import time).
-
-    Uses the same 9-image torus metric as _min_dist_to_stones_torus:
-    for each of the 9 wrapping offsets (a, b) in {-1, 0, 1}^2, compute
-    hex distance = max(|dq|, |dr|, |dq+dr|), then take the min.
-    """
-    N = BOARD_SIZE
-    qs = np.arange(N_CELLS) // N
-    rs = np.arange(N_CELLS) % N
-    best = np.full((N_CELLS, N_CELLS), N * 2, dtype=np.int16)
-    for a in (-1, 0, 1):
-        for b in (-1, 0, 1):
-            dq = (qs[:, None] - qs[None, :] + a * N).astype(np.int16)
-            dr = (rs[:, None] - rs[None, :] + b * N).astype(np.int16)
-            d = np.maximum(np.maximum(np.abs(dq), np.abs(dr)),
-                           np.abs(dq + dr))
-            best = np.minimum(best, d)
-    return best
-
-_ALL_DISTS = _build_all_pairwise_distances()  # [625, 625] ~0.75MB
-
-
-def _min_dist_array(occupied_indices) -> np.ndarray:
-    """Return [N_CELLS] array of min hex distance to any occupied cell.
-
-    Vectorized: single numpy indexing + min, replaces per-candidate Python loop.
-    """
-    occ = np.array(list(occupied_indices), dtype=np.intp)
-    if len(occ) == 0:
-        return np.full(N_CELLS, BOARD_SIZE, dtype=np.int16)
-    return _ALL_DISTS[occ].min(axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -262,14 +221,10 @@ class MCTSTree:
     root_player: Player | None = None
     root_value: float = 0.0
     root_occupied: frozenset | None = None   # occupied cells at root
-    noise_dist_scale: float = 0.0            # for distance-aware exploration noise
-    max_cand_dist: int | None = None         # distance gate for candidates
-    next_dist_frac: float = 0.0              # interpolation fraction for next ring
     board_width: int = BOARD_SIZE            # width of the board (for dynamic sizing)
     n_cells: int = N_CELLS                   # board_width ** 2
     _root_occ_idx: frozenset | None = None   # cached occupied indices (int)
     _root_nearby: set | None = None          # cached nearby candidates at root
-    _root_min_dists: np.ndarray | None = None  # [N_CELLS] min dist to any stone
 
 
 # ---------------------------------------------------------------------------
@@ -310,14 +265,9 @@ def _get_candidates(game_or_board) -> set[tuple[int, int]]:
 
 def _nearby_candidates(
     occupied_indices: set[int] | frozenset[int],
-    max_dist: int,
-    next_dist_frac: float = 0.0,
+    max_dist: int = MAX_CAND_DIST,
 ) -> set[int]:
-    """Return cell indices within *max_dist* of any occupied cell (fast lookup).
-
-    When *next_dist_frac* > 0, each cell at exactly max_dist+1 is included
-    with that probability — gradual introduction of the next distance ring.
-    """
+    """Return cell indices within *max_dist* of any occupied cell (fast lookup)."""
     _t0 = time.monotonic()
     if not occupied_indices:
         return set()
@@ -326,20 +276,6 @@ def _nearby_candidates(
     for stone_idx in occupied_indices:
         result |= table[stone_idx]
     result -= occupied_indices
-
-    # Gradually introduce next-distance cells
-    if next_dist_frac > 0 and max_dist < BOARD_SIZE // 2:
-        next_table = _NEIGHBORS_WITHIN[max_dist + 1]
-        next_ring: set[int] = set()
-        for stone_idx in occupied_indices:
-            next_ring |= next_table[stone_idx]
-        next_ring -= result
-        next_ring -= occupied_indices
-        if next_ring:
-            for idx in next_ring:
-                if np.random.random() < next_dist_frac:
-                    result.add(idx)
-
     cpu_profile.nearby_cands += time.monotonic() - _t0
     return result
 
@@ -417,53 +353,18 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Dirichlet noise (distance-aware)
+# Dirichlet noise
 # ---------------------------------------------------------------------------
 
-def _min_dist_to_stones_torus(q: int, r: int, occupied, N: int = BOARD_SIZE) -> int:
-    """Minimum hex distance from (q, r) to any occupied cell on the torus."""
-    min_d = N
-    for oq, or_ in occupied:
-        raw_dq = q - oq
-        raw_dr = r - or_
-        for a in (-1, 0, 1):
-            dq = raw_dq + a * N
-            for b in (-1, 0, 1):
-                dr = raw_dr + b * N
-                d = max(abs(dq), abs(dr), abs(dq + dr))
-                if d < min_d:
-                    min_d = d
-                    if d <= 1:
-                        return d
-    return min_d
-
-
 def _add_exploration_noise(node: MCTSNode, alpha: float | None = None,
-                           frac: float = DIRICHLET_FRAC,
-                           occupied: frozenset | None = None,
-                           noise_dist_scale: float = 0.0,
-                           min_dists: np.ndarray | None = None):
-    """Add Dirichlet noise to priors with distance-based weighting.
+                           frac: float = DIRICHLET_FRAC):
+    """Add Dirichlet noise to priors (standard AlphaZero).
 
     final_prior = (1 - frac) * prior + frac * Dir(alpha)
 
     When *alpha* is None (default), it scales as 10/n_candidates so the
     noise concentration adapts to the candidate count -- smoother for small
     sets, sparser for large ones.
-
-    Each candidate's noise fraction is scaled by its hex distance to the
-    nearest existing stone:
-      d <= 2:  weight = 1.0  (full noise, matches distillation radius)
-      d > 2:   weight = exp(-(d - 2) / noise_dist_scale)
-
-    noise_dist_scale controls the exponential tail beyond dist 2:
-      0.0   -> noise only on cells within dist 2
-      1.0   -> dist 3 ≈ 37%, dist 4 ≈ 14%, dist 5 ≈ 5%
-      3.0   -> dist 3 ≈ 72%, dist 4 ≈ 51%, dist 5 ≈ 37%
-      large -> effectively uniform noise
-
-    *min_dists*: optional precomputed [N_CELLS] array of min distances to
-    any occupied cell (from _min_dist_array).  Avoids recomputation.
     """
     _t0 = time.monotonic()
     if node.actions is None:
@@ -473,40 +374,9 @@ def _add_exploration_noise(node: MCTSNode, alpha: float | None = None,
         alpha = 10.0 / n
     dirichlet = np.random.dirichlet([alpha] * n)
     priors = node.priors
-
-    if occupied is None or not occupied:
-        keep = 1.0 - frac
-        node.priors = [keep * priors[i] + frac * dirichlet[i]
-                       for i in range(n)]
-        cpu_profile.noise += time.monotonic() - _t0
-        return
-
-    # Vectorized distance computation: one numpy call instead of N Python loops
-    if min_dists is None:
-        occ_idx = [_cell_to_idx(q, r) for q, r in occupied]
-        min_dists = _min_dist_array(occ_idx)
-
-    actions = node.actions
-    dists = min_dists[actions]  # [n] distances for candidate cells
-
-    # Vectorized weight computation
-    weights = np.ones(n, dtype=np.float64)
-    far = dists > 2
-    if noise_dist_scale <= 0.0:
-        weights[far] = 0.0
-    else:
-        weights[far] = np.exp(-(dists[far].astype(np.float64) - 2.0)
-                              / noise_dist_scale)
-
-    # Blend priors with noise
-    fi = frac * weights
-    p = np.array(priors)
-    new_priors = (1.0 - fi) * p + fi * dirichlet
-
-    total = new_priors.sum()
-    if total > 0:
-        new_priors /= total
-    node.priors = new_priors.tolist()
+    keep = 1.0 - frac
+    node.priors = [keep * priors[i] + frac * dirichlet[i]
+                   for i in range(n)]
     cpu_profile.noise += time.monotonic() - _t0
 
 
@@ -531,15 +401,11 @@ def _build_tree_from_eval(
     marginal: torch.Tensor,
     root_planes: torch.Tensor,
     add_noise: bool = True,
-    noise_dist_scale: float = 0.0,
-    max_cand_dist: int | None = DEFAULT_MAX_CAND_DIST,
-    next_dist_frac: float = 0.0,
 ) -> MCTSTree:
     """Build an MCTSTree from pre-computed NN outputs (no model call).
 
-    When *max_cand_dist* is set, only empty cells within that hex distance
-    of an existing stone are considered as candidates.  *next_dist_frac*
-    controls gradual introduction of the next distance ring.
+    Only empty cells within MAX_CAND_DIST of an existing stone are
+    considered as candidates.
     """
     _t0 = time.monotonic()
     pos = PosNode()
@@ -563,20 +429,12 @@ def _build_tree_from_eval(
 
     cached_occ_idx = None
     cached_nearby = None
-    cached_min_dists = None
     if has_stones:
         occ_idx = frozenset(_cell_to_idx(q, r) for q, r in occupied)
         cached_occ_idx = occ_idx
-        # Vectorized min-distance array (used by noise + available for l2)
-        cached_min_dists = _min_dist_array(occ_idx)
-        if max_cand_dist is not None:
-            nearby = _nearby_candidates(
-                occ_idx, max_cand_dist, next_dist_frac)
-            cand_indices = list(nearby)
-            cached_nearby = nearby
-        else:
-            cand_indices = [_cell_to_idx(q, r)
-                            for q, r in _ALL_CELLS - set(occupied)]
+        nearby = _nearby_candidates(occ_idx)
+        cand_indices = list(nearby)
+        cached_nearby = nearby
     else:
         cand_indices = [_cell_to_idx(BOARD_SIZE // 2, BOARD_SIZE // 2)]
 
@@ -587,9 +445,7 @@ def _build_tree_from_eval(
     _init_node_children(pos.move_node, cand_priors)
 
     if add_noise:
-        _add_exploration_noise(pos.move_node, occupied=occupied_frozen,
-                               noise_dist_scale=noise_dist_scale,
-                               min_dists=cached_min_dists)
+        _add_exploration_noise(pos.move_node)
 
     root_player = cp if hasattr(cp, 'value') else Player(cp)
     tree = MCTSTree(
@@ -599,12 +455,8 @@ def _build_tree_from_eval(
         root_player=root_player,
         root_value=root_value,
         root_occupied=occupied_frozen,
-        noise_dist_scale=noise_dist_scale,
-        max_cand_dist=max_cand_dist,
-        next_dist_frac=next_dist_frac,
         _root_occ_idx=cached_occ_idx,
         _root_nearby=cached_nearby,
-        _root_min_dists=cached_min_dists,
     )
     cpu_profile.build_tree += time.monotonic() - _t0
     return tree
@@ -615,9 +467,6 @@ def create_tree(
     model: torch.nn.Module,
     device: torch.device,
     add_noise: bool = True,
-    noise_dist_scale: float = 0.0,
-    max_cand_dist: int | None = DEFAULT_MAX_CAND_DIST,
-    next_dist_frac: float = 0.0,
 ) -> MCTSTree:
     """Create a single MCTS tree with one B=1 NN forward pass."""
     from model.resnet import board_to_planes_torus
@@ -634,9 +483,7 @@ def create_tree(
     marginal = pair_probs.sum(dim=-1)
 
     return _build_tree_from_eval(
-        game, root_value, pair_probs, marginal, planes, add_noise,
-        noise_dist_scale=noise_dist_scale,
-        max_cand_dist=max_cand_dist, next_dist_frac=next_dist_frac)
+        game, root_value, pair_probs, marginal, planes, add_noise)
 
 
 @torch.no_grad()
@@ -645,9 +492,6 @@ def create_trees_batched(
     model: torch.nn.Module,
     device: torch.device,
     add_noise: bool = True,
-    noise_dist_scale: float = 0.0,
-    max_cand_dist: int | None = DEFAULT_MAX_CAND_DIST,
-    next_dist_frac: float = 0.0,
 ) -> list[MCTSTree]:
     """Create trees for multiple games in one batched forward pass."""
     from model.resnet import board_to_planes_torus
@@ -675,9 +519,7 @@ def create_trees_batched(
             N_CELLS, N_CELLS).cpu()
         mg = pp.sum(dim=-1)
         tree = _build_tree_from_eval(
-            game, root_value, pp, mg, batch[i].cpu(), add_noise,
-            noise_dist_scale=noise_dist_scale,
-            max_cand_dist=max_cand_dist, next_dist_frac=next_dist_frac)
+            game, root_value, pp, mg, batch[i].cpu(), add_noise)
         trees.append(tree)
 
     return trees
@@ -759,27 +601,6 @@ def create_tree_dynamic(
     return tree, off_q, off_r
 
 
-def compute_max_cand_dist(round_num: int) -> tuple[int | None, float]:
-    """Distance gate for the given self-play round.
-
-    Returns (max_dist, next_frac):
-      max_dist:   fully-included distance (None = no limit)
-      next_frac:  fraction of (max_dist+1) cells to include (0.0–1.0)
-
-    Starts at DIST_GATE_BASE (2) and ramps the next ring linearly over
-    DIST_GATE_RAMP_ROUNDS, then steps up and repeats.
-    """
-    d = DIST_GATE_BASE + round_num // DIST_GATE_RAMP_ROUNDS
-    frac = (round_num % DIST_GATE_RAMP_ROUNDS) / DIST_GATE_RAMP_ROUNDS
-    # Cap at DIST_GATE_BASE (no ramp beyond it)
-    if d >= DIST_GATE_BASE:
-        d = DIST_GATE_BASE
-        frac = 0.0
-    if d >= BOARD_SIZE // 2:
-        return None, 0.0  # no limit — full board
-    return d, frac
-
-
 # ---------------------------------------------------------------------------
 # Level-2 expansion (root only)
 # ---------------------------------------------------------------------------
@@ -794,32 +615,25 @@ def _expand_level2(
     """Expand level-2 children for a stone_1 action at root.
 
     Uses tree.pair_probs for conditional priors.  Candidates are filtered
-    by the tree's max_cand_dist setting.
+    to cells within MAX_CAND_DIST of any occupied cell or stone_1.
     """
     _t0 = time.monotonic()
     cond_probs = tree.pair_probs[stone1_idx]  # [N_CELLS]
 
     # All empty cells except stone_1, filtered by distance
-    _bw = tree.board_width
-    _nc = tree.n_cells
-    if tree.max_cand_dist is not None and tree._root_nearby is not None:
+    if tree._root_nearby is not None:
         # Extend cached root nearby set with stone1's own neighbors
-        table = _NEIGHBORS_WITHIN[tree.max_cand_dist]
+        table = _NEIGHBORS_WITHIN[MAX_CAND_DIST]
         cand_set = tree._root_nearby | table[stone1_idx]
         cand_set -= tree._root_occ_idx
         cand_set.discard(stone1_idx)
         cand_indices = list(cand_set)
-    elif tree.max_cand_dist is not None:
+    else:
+        _bw = tree.board_width
         occ_idx = set(
             _cell_to_idx(q, r, _bw) for q, r in tree.root_occupied
         ) | {stone1_idx}
-        cand_indices = list(
-            _nearby_candidates(occ_idx, tree.max_cand_dist,
-                               tree.next_dist_frac))
-    else:
-        occ_set = set(_cell_to_idx(q, r, _bw) for q, r in tree.root_occupied)
-        occ_set.add(stone1_idx)
-        cand_indices = [i for i in range(_nc) if i not in occ_set]
+        cand_indices = list(_nearby_candidates(occ_idx))
 
     cand_values = cond_probs[cand_indices].tolist()
     cand_priors = list(zip(cand_indices, cand_values))
@@ -833,13 +647,7 @@ def _expand_level2(
     _init_node_children(l2_node, cand_priors)
 
     if add_noise:
-        if hasattr(game, 'get_occupied_set'):
-            occ = game.get_occupied_set()
-        else:
-            occ = frozenset(game.board.keys())
-        _add_exploration_noise(l2_node, occupied=occ,
-                               noise_dist_scale=tree.noise_dist_scale,
-                               min_dists=tree._root_min_dists)
+        _add_exploration_noise(l2_node)
 
     if pos.move_node.level2 is None:
         pos.move_node.level2 = {}

@@ -30,7 +30,7 @@ from mcts.tree import (
     N_CELLS, select_leaf,
     expand_and_backprop, maybe_expand_leaf, get_pair_visits, get_single_visits,
     select_move_pair, select_single_move, _build_tree_from_eval,
-    compute_max_cand_dist,
+    _hex_dist_torus,
 )
 from model.resnet import BOARD_SIZE
 
@@ -132,16 +132,14 @@ def _worker_fn(worker_id, n_workers, batch_size, n_sims,
                game_dicts, next_game_id_start,
                shared_bufs, sync, round_id,
                late_temperature, draw_penalty,
-               noise_dist_scale,
-               result_queue, max_cand_dist=None, next_dist_frac=0.0):
+               result_queue):
     """Worker process: owns games/trees, does select + backprop."""
     try:
         _worker_loop(worker_id, n_workers, batch_size, n_sims,
                      game_dicts, next_game_id_start,
                      shared_bufs, sync, round_id,
                      late_temperature, draw_penalty,
-                     noise_dist_scale,
-                     result_queue, max_cand_dist, next_dist_frac)
+                     result_queue)
     except Exception as e:
         sync['error'].value = 1
         result_queue.put(('error', worker_id, traceback.format_exc()))
@@ -156,8 +154,7 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                  game_dicts, next_game_id_start,
                  shared_bufs, sync, round_id,
                  late_temperature, draw_penalty,
-                 noise_dist_scale,
-                 result_queue, max_cand_dist=None, next_dist_frac=0.0):
+                 result_queue):
     """Inner worker loop (unwrapped for clean error handling)."""
     games_per_worker = batch_size // n_workers
     my_start = worker_id * games_per_worker
@@ -237,9 +234,6 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                     shared_bufs.tree_marginals[gi].clone(),
                     shared_bufs.tree_planes[gi].clone(),
                     add_noise=True,
-                    noise_dist_scale=noise_dist_scale,
-                    max_cand_dist=max_cand_dist,
-                    next_dist_frac=next_dist_frac,
                 )
 
         # Step 5: barrier + clear events
@@ -306,6 +300,8 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
 
         # ---- Move selection + example recording ----
         completed = []
+        turn_far_total = 0
+        turn_stones_total = 0
         next_gid = next_game_id_start + batch_size + worker_id
         for i, slot in enumerate(slots):
             turn = slot.turn_number
@@ -345,10 +341,20 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
             }
             slot.examples.append(ex)
 
-            # Apply moves
+            # Apply moves (track distance from existing stones)
             for q, r in moves:
                 if slot.game.game_over:
                     break
+                if hasattr(slot.game, 'get_occupied_set'):
+                    occ = slot.game.get_occupied_set()
+                else:
+                    occ = frozenset(slot.game.board.keys())
+                if occ:
+                    min_d = min(_hex_dist_torus(q, r, oq, or_)
+                                for oq, or_ in occ)
+                    turn_stones_total += 1
+                    if min_d > 2:
+                        turn_far_total += 1
                 slot.game.make_move(q, r)
 
             slot.turn_number += 1
@@ -404,9 +410,10 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                 slot.examples = []
                 slot.turn_number = 0
 
-        # Send completed games to main
+        # Send completed games + far-move stats to main
         result_queue.put(('turn_done', worker_id, completed,
-                          [_serialize_slot(s) for s in slots]))
+                          [_serialize_slot(s) for s in slots],
+                          turn_far_total, turn_stones_total))
 
 
 def _write_delta(shared, leaf, tree, global_idx, buf_idx):
@@ -528,8 +535,7 @@ def _gpu_tree_forward(model, device, shared):
 
 def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
                       n_workers=8, late_temperature=0.3, draw_penalty=0.1,
-                      model_kwargs=None, viewer=None, max_cand_dist=None,
-                      next_dist_frac=0.0):
+                      model_kwargs=None, viewer=None):
     """Generate self-play games using multiprocessing.
 
     Returns (all_examples, draw_rate).
@@ -577,7 +583,7 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
                   game_dicts, next_game_id,
                   shared, sync, round_id,
                   late_temperature, draw_penalty,
-                  result_queue, max_cand_dist, next_dist_frac),
+                  result_queue),
         )
         p.start()
         workers.append(p)
@@ -587,6 +593,8 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
     games_completed = 0
     wins_a = wins_b = draws = 0
     total_turns = 0
+    far_stones = 0
+    total_stones = 0
 
     pbar = tqdm(total=target, desc="Games", unit="game", position=0)
     pos_bar = tqdm(desc="Positions", unit="pos", position=1)
@@ -667,7 +675,9 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
                 if msg[0] == 'error':
                     raise RuntimeError(f"Worker {msg[1]} failed:\n{msg[2]}")
 
-                _, wid, completed, slot_data = msg
+                _, wid, completed, slot_data, w_far, w_total = msg
+                far_stones += w_far
+                total_stones += w_total
                 for c in completed:
                     all_examples.extend(c['examples'])
                     w = c['winner']
@@ -745,7 +755,8 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
     draw_rate = draws / max(total_games, 1)
     decisive = wins_a + wins_b
     a_win_rate = wins_a / max(decisive, 1)
-    return all_examples, draw_rate, a_win_rate
+    far_pct = 100 * far_stones / max(total_stones, 1)
+    return all_examples, draw_rate, a_win_rate, far_pct
 
 
 def _drain_errors(queue):
@@ -798,10 +809,7 @@ class ParallelSelfPlayPool:
         self._round_id = mp.Value('i', -1)
         self._late_temperature = mp.Value('f', 0.3)
         self._draw_penalty = mp.Value('f', 0.1)
-        self._noise_dist_scale = mp.Value('f', 0.0)
         self._round_stop = mp.Value('i', 0)
-        self._max_cand_dist = mp.Value('i', -1)  # -1 = no limit
-        self._next_dist_frac = mp.Value('f', 0.0)
         self._new_round = mp.Event()
         # Barrier for workers + main to sync at round end
         self._round_end_barrier = mp.Barrier(n_workers + 1)
@@ -825,9 +833,8 @@ class ParallelSelfPlayPool:
                       game_dicts, next_game_id,
                       self.shared, self.sync,
                       self._round_id, self._late_temperature,
-                      self._draw_penalty, self._noise_dist_scale,
+                      self._draw_penalty,
                       self._round_stop,
-                      self._max_cand_dist, self._next_dist_frac,
                       self._new_round, self._round_end_barrier,
                       self._next_game_id,
                       self.result_queue),
@@ -838,9 +845,7 @@ class ParallelSelfPlayPool:
 
     def generate_round(self, model, device, round_id, data_dir,
                        late_temperature=0.3, draw_penalty=0.1,
-                       noise_dist_scale=0.0,
-                       target=None, viewer=None,
-                       max_cand_dist=None, next_dist_frac=0.0):
+                       target=None, viewer=None):
         """Run one round of self-play. Returns (examples, draw_rate)."""
         if not self._alive:
             raise RuntimeError("Pool not started")
@@ -852,10 +857,7 @@ class ParallelSelfPlayPool:
         self._round_id.value = round_id
         self._late_temperature.value = late_temperature
         self._draw_penalty.value = draw_penalty
-        self._noise_dist_scale.value = noise_dist_scale
         self._round_stop.value = 0
-        self._max_cand_dist.value = max_cand_dist if max_cand_dist is not None else -1
-        self._next_dist_frac.value = next_dist_frac
 
         # Reset sync state for fresh round
         self.sync['error'].value = 0
@@ -875,6 +877,8 @@ class ParallelSelfPlayPool:
         games_completed = 0
         wins_a = wins_b = draws = 0
         total_moves = 0
+        far_stones = 0
+        total_stones = 0
 
         pbar = tqdm(total=target, desc="Games", unit="game", position=0)
         pos_bar = tqdm(desc="Positions", unit="pos", position=1)
@@ -972,7 +976,9 @@ class ParallelSelfPlayPool:
                         raise RuntimeError(
                             f"Worker {msg[1]} failed:\n{msg[2]}")
 
-                    _, wid, completed, slot_data = msg
+                    _, wid, completed, slot_data, w_far, w_total = msg
+                    far_stones += w_far
+                    total_stones += w_total
                     for c in completed:
                         all_examples.extend(c['examples'])
                         w = c['winner']
@@ -1068,7 +1074,8 @@ class ParallelSelfPlayPool:
         decisive = wins_a + wins_b
         a_win_rate = wins_a / max(decisive, 1)
         avg_moves = total_moves / max(total_games, 1)
-        return all_examples, draw_rate, a_win_rate, avg_moves
+        far_pct = 100 * far_stones / max(total_stones, 1)
+        return all_examples, draw_rate, a_win_rate, avg_moves, far_pct
 
     def shutdown(self):
         """Stop all workers permanently and clean up."""
@@ -1101,8 +1108,7 @@ def _pool_worker_fn(worker_id, n_workers, batch_size, n_sims,
                     game_dicts, next_game_id_start,
                     shared_bufs, sync,
                     round_id_val, late_temp_val, draw_penalty_val,
-                    noise_dist_scale_val,
-                    round_stop, max_cand_dist_val, next_dist_frac_val,
+                    round_stop,
                     new_round_event, round_end_barrier,
                     next_game_id_shared,
                     result_queue):
@@ -1113,8 +1119,7 @@ def _pool_worker_fn(worker_id, n_workers, batch_size, n_sims,
             game_dicts, next_game_id_start,
             shared_bufs, sync,
             round_id_val, late_temp_val, draw_penalty_val,
-            noise_dist_scale_val,
-            round_stop, max_cand_dist_val, next_dist_frac_val,
+            round_stop,
             new_round_event, round_end_barrier,
             next_game_id_shared,
             result_queue)
@@ -1135,8 +1140,7 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                       game_dicts, next_game_id_start,
                       shared_bufs, sync,
                       round_id_val, late_temp_val, draw_penalty_val,
-                      noise_dist_scale_val,
-                      round_stop, max_cand_dist_val, next_dist_frac_val,
+                      round_stop,
                       new_round_event, round_end_barrier,
                       next_game_id_shared,
                       result_queue):
@@ -1189,7 +1193,6 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
         round_id = round_id_val.value
         late_temperature = late_temp_val.value
         draw_penalty = draw_penalty_val.value
-        noise_dist_scale = noise_dist_scale_val.value
 
         # ---- Inner turn loop ----
         while not stop_flag.value and not round_stop.value:
@@ -1224,9 +1227,6 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
             for i, slot in enumerate(slots):
                 gi = my_start + i
                 if shared_bufs.tree_needs_init[gi]:
-                    mcd = max_cand_dist_val.value
-                    mcd = None if mcd < 0 else mcd
-                    ndf = next_dist_frac_val.value
                     slot.tree = _build_tree_from_eval(
                         slot.game,
                         shared_bufs.tree_values[gi].item(),
@@ -1234,9 +1234,6 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                         shared_bufs.tree_marginals[gi].clone(),
                         shared_bufs.tree_planes[gi].clone(),
                         add_noise=True,
-                        noise_dist_scale=noise_dist_scale,
-                        max_cand_dist=mcd,
-                        next_dist_frac=ndf,
                     )
 
             try:
@@ -1299,6 +1296,8 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
 
             # --- Move selection + example recording ---
             completed = []
+            turn_far_total = 0
+            turn_stones_total = 0
             for i, slot in enumerate(slots):
                 turn = slot.turn_number
                 temp = 1.0 if turn < 20 else late_temperature
@@ -1337,9 +1336,20 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                 }
                 slot.examples.append(ex)
 
+                # Apply moves (track distance from existing stones)
                 for q, r in moves:
                     if slot.game.game_over:
                         break
+                    if hasattr(slot.game, 'get_occupied_set'):
+                        occ = slot.game.get_occupied_set()
+                    else:
+                        occ = frozenset(slot.game.board.keys())
+                    if occ:
+                        min_d = min(_hex_dist_torus(q, r, oq, or_)
+                                    for oq, or_ in occ)
+                        turn_stones_total += 1
+                        if min_d > 2:
+                            turn_far_total += 1
                     slot.game.make_move(q, r)
 
                 slot.turn_number += 1
@@ -1396,7 +1406,8 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                     slot.turn_number = 0
 
             result_queue.put(('turn_done', worker_id, completed,
-                              [_serialize_slot(s) for s in slots]))
+                              [_serialize_slot(s) for s in slots],
+                              turn_far_total, turn_stones_total))
 
         # Round done -- update shared next_game_id and wait at barrier
         next_game_id_shared.value = max(

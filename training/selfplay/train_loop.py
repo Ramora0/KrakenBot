@@ -1033,10 +1033,6 @@ def main():
                         help="Max SFT examples to sample per round")
     parser.add_argument("--sft-anneal-rounds", type=int, default=10,
                         help="Linearly anneal SFT weight to 0 over N rounds")
-    parser.add_argument("--noise-warmup-rounds", type=int, default=10,
-                        help="Rounds of dist-2-only exploration noise before annealing")
-    parser.add_argument("--noise-dist-anneal-rate", type=float, default=0.05,
-                        help="noise_dist_scale grows by this per round after warmup")
     parser.add_argument("--no-parallel", action="store_true",
                         help="Disable parallel self-play (use sequential)")
     parser.add_argument("--n-workers", type=int, default=8,
@@ -1203,43 +1199,23 @@ def main():
 
             # --- 1. Self-play ---
             from training.selfplay.self_play import SelfPlayManager
-            from mcts.tree import compute_max_cand_dist
             print(f"\n--- Self-play ---")
             model.eval()
             model.bfloat16()
-
-            # Compute noise distance scale for this round
-            warmup = args.noise_warmup_rounds
-            if round_num < warmup:
-                noise_dist_scale = 0.0
-            else:
-                noise_dist_scale = (round_num - warmup) * args.noise_dist_anneal_rate
-            print(f"  noise_dist_scale={noise_dist_scale:.2f}")
-
-            max_cand_dist, next_dist_frac = compute_max_cand_dist(round_num)
-            if max_cand_dist is not None:
-                dist_msg = (f"max_cand_dist={max_cand_dist}"
-                            f" +{next_dist_frac:.0%} of dist-{max_cand_dist+1}")
-            else:
-                dist_msg = "no limit"
-            print(f"  Distance gate: {dist_msg}")
 
             if use_parallel:
                 target = COLD_START_GAMES if (
                     is_cold_start and round_num == start_round
                 ) else COMPLETED_PER_ROUND
-                examples, draw_rate, a_win_rate, avg_moves = \
+                examples, draw_rate, a_win_rate, avg_moves, far_pct = \
                     pool.generate_round(
                         model, device,
                         round_id=round_num,
                         data_dir=args.data_dir,
                         late_temperature=args.late_temperature,
                         draw_penalty=args.draw_penalty,
-                        noise_dist_scale=noise_dist_scale,
                         target=target,
                         viewer=viewer,
-                        max_cand_dist=max_cand_dist,
-                        next_dist_frac=next_dist_frac,
                     )
                 # Save examples
                 manager = SelfPlayManager(
@@ -1254,9 +1230,6 @@ def main():
                     viewer=viewer,
                     late_temperature=args.late_temperature,
                     draw_penalty=args.draw_penalty,
-                    noise_dist_scale=noise_dist_scale,
-                    max_cand_dist=max_cand_dist,
-                    next_dist_frac=next_dist_frac,
                 )
                 examples, draw_rate, a_win_rate, avg_moves, far_pct = \
                     manager.generate(round_num)
@@ -1355,7 +1328,6 @@ def main():
                     "a_win_pct": a_win_rate,
                     "avg_moves": avg_moves,
                     "far_move_pct": far_pct,
-                    "noise_dist_scale": noise_dist_scale,
                     "examples": len(examples),
                     "time_gen": t_gen,
                     "time_train": t_train,
