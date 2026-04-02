@@ -499,8 +499,12 @@ def compute_selfplay_loss(value_pred, pair_logits, moves_left_pred, chain_pred,
     """Combined loss: value + policy + moves_left + chain."""
     B, N_sq, _ = pair_logits.shape
 
-    # --- Primary losses ---
-    value_loss = F.mse_loss(value_pred, value_target)
+    # --- Primary losses (value masked on drawn games) ---
+    decisive = ~draw_mask
+    if decisive.any():
+        value_loss = F.mse_loss(value_pred[decisive], value_target[decisive])
+    else:
+        value_loss = torch.zeros(1, device=value_pred.device).squeeze()
 
     flat_logits = pair_logits.reshape(B, -1)
     log_probs = F.log_softmax(flat_logits, dim=-1)
@@ -521,18 +525,10 @@ def compute_selfplay_loss(value_pred, pair_logits, moves_left_pred, chain_pred,
     masked = chain_diff_sq * chain_mask
     chain_loss = masked.sum() / chain_mask.sum().clamp(min=1)
 
-    # Decisive-only value loss (for reporting, not used in total)
-    decisive_mask = ~draw_mask
-    if decisive_mask.any():
-        decisive_vloss = F.mse_loss(value_pred[decisive_mask],
-                                    value_target[decisive_mask])
-    else:
-        decisive_vloss = torch.zeros(1, device=value_pred.device).squeeze()
-
     total = (value_weight * value_loss + policy_loss
              + 0.1 * ml_loss + 0.1 * chain_loss)
 
-    return total, value_loss, policy_loss, ml_loss, chain_loss, decisive_vloss
+    return total, value_loss, policy_loss, ml_loss, chain_loss
 
 
 def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
@@ -553,7 +549,6 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
     total_ploss = 0.0
     total_ml_loss = 0.0
     total_chain_loss = 0.0
-    total_decisive_vloss = 0.0
     total_entropy = 0.0
     n_batches = 0
 
@@ -573,7 +568,7 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
         if use_amp:
             with torch.amp.autocast("cuda"):
                 value_pred, pair_logits, ml_pred, chain_pred = model(planes)
-                loss, vloss, ploss, ml_loss, cl, dvloss = compute_selfplay_loss(
+                loss, vloss, ploss, ml_loss, cl = compute_selfplay_loss(
                     value_pred, pair_logits, ml_pred, chain_pred,
                     visit_dist, value_target, ml_target, drawn,
                     chain_target, chain_mask,
@@ -585,7 +580,7 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
             scaler.update()
         else:
             value_pred, pair_logits, ml_pred, chain_pred = model(planes)
-            loss, vloss, ploss, ml_loss, cl, dvloss = compute_selfplay_loss(
+            loss, vloss, ploss, ml_loss, cl = compute_selfplay_loss(
                 value_pred, pair_logits, ml_pred, chain_pred,
                 visit_dist, value_target, ml_target, drawn,
                 chain_target, chain_mask,
@@ -605,13 +600,11 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
         total_ploss += ploss.item()
         total_ml_loss += ml_loss.item()
         total_chain_loss += cl.item()
-        total_decisive_vloss += dvloss.item()
         n_batches += 1
 
     d = max(n_batches, 1)
     return (total_loss / d, total_vloss / d, total_ploss / d,
-            total_ml_loss / d, total_chain_loss / d, total_entropy / d,
-            total_decisive_vloss / d)
+            total_ml_loss / d, total_chain_loss / d, total_entropy / d)
 
 
 # ---------------------------------------------------------------------------
@@ -1289,10 +1282,9 @@ def main():
                 scaler=scaler,
                 value_weight=args.value_weight,
             )
-            avg_loss, avg_vloss, avg_ploss, avg_ml, avg_chain, avg_entropy, avg_dvloss = losses
+            avg_loss, avg_vloss, avg_ploss, avg_ml, avg_chain, avg_entropy = losses
             t_train = time.time() - t1
             print(f"  Loss: {avg_loss:.4f} (value={avg_vloss:.4f}, "
-                  f"decisive_value={avg_dvloss:.4f}, "
                   f"policy={avg_ploss:.4f}, ml={avg_ml:.4f}, "
                   f"chain={avg_chain:.4f}, entropy={avg_entropy:.4f})")
 
@@ -1345,7 +1337,6 @@ def main():
                     "round": round_num,
                     "loss": avg_loss,
                     "value_loss": avg_vloss,
-                    "decisive_value_loss": avg_dvloss,
                     "policy_loss": avg_ploss,
                     "moves_left_loss": avg_ml,
                     "chain_loss": avg_chain,
