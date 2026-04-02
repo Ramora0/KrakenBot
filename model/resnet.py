@@ -53,8 +53,8 @@ class PairPolicyHead(nn.Module):
         B, C, H, W = trunk_features.shape
         N = H * W
 
-        Q = self.q_proj(trunk_features).flatten(2).float()  # [B, d, N]
-        K = self.k_proj(trunk_features).flatten(2).float()  # [B, d, N]
+        Q = self.q_proj(trunk_features).flatten(2)  # [B, d, N]
+        K = self.k_proj(trunk_features).flatten(2)  # [B, d, N]
 
         A = torch.bmm(Q.transpose(1, 2), K) * self.scale  # [B, N, N]
         A = (A + A.transpose(1, 2)) / 2  # symmetrize

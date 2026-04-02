@@ -28,6 +28,7 @@ from mcts.tree import (
     MCTSTree, N_CELLS, NON_ROOT_TOP_K, create_trees_batched, select_leaf,
     expand_and_backprop, maybe_expand_leaf, get_pair_visits, get_single_visits,
     select_move_pair, select_single_move, compute_max_cand_dist,
+    cpu_profile, _hex_dist_torus,
 )
 from model.resnet import BOARD_SIZE
 from game import ToroidalHexGame, TORUS_SIZE
@@ -156,6 +157,8 @@ class SelfPlayManager:
         draws = 0
         total_positions = 0
         total_moves_in_completed = 0
+        far_stones = 0      # stones placed > dist 2 from any existing stone
+        total_stones = 0    # all stones placed (excl. first center stone)
 
         slots, next_game_id, is_cold_start = self._load_or_create_slots()
         target = COLD_START_GAMES if is_cold_start else COMPLETED_PER_ROUND
@@ -185,6 +188,7 @@ class SelfPlayManager:
         n_turns = 0
         self._t_delta = 0.0    # delta plane construction
         self._t_forward = 0.0  # transfer + model forward + transfer back
+        cpu_profile.reset()
 
         _sel = select_leaf_cy if _HAS_CY else select_leaf
         _bp = backprop_cy if _HAS_CY else expand_and_backprop
@@ -339,10 +343,20 @@ class SelfPlayManager:
                 total_positions += 1
                 pos_bar.update(1)
 
-                # Apply moves
+                # Apply moves (track distance from existing stones)
                 for q, r in moves:
                     if slot.game.game_over:
                         break
+                    if hasattr(slot.game, 'get_occupied_set'):
+                        occ = slot.game.get_occupied_set()
+                    else:
+                        occ = frozenset(slot.game.board.keys())
+                    if occ:
+                        min_d = min(_hex_dist_torus(q, r, oq, or_)
+                                    for oq, or_ in occ)
+                        total_stones += 1
+                        if min_d > 2:
+                            far_stones += 1
                     slot.game.make_move(q, r)
 
                 slot.turn_number += 1
@@ -436,13 +450,18 @@ class SelfPlayManager:
                 pct = 100 * t / t_total
                 per_turn = 1000 * t / n_turns
                 print(f"    {label:>15s}: {t:7.1f}s ({pct:5.1f}%)  {per_turn:6.1f}ms/turn")
+            print(f"\n  CPU sub-profile:")
+            print(cpu_profile.report(t_total))
 
         total_games = wins_a + wins_b + draws
         draw_rate = draws / max(total_games, 1)
         decisive = wins_a + wins_b
         a_win_rate = wins_a / max(decisive, 1)
         avg_moves = total_moves_in_completed / max(total_games, 1)
-        return all_examples, draw_rate, a_win_rate, avg_moves
+        far_pct = 100 * far_stones / max(total_stones, 1)
+        print(f"  Far moves (>dist 2): {far_stones}/{total_stones} "
+              f"({far_pct:.1f}%)")
+        return all_examples, draw_rate, a_win_rate, avg_moves, far_pct
 
     def _new_slot(self, game_id: int) -> SelfPlaySlot:
         """Create a new game slot on a toroidal board. First move at center."""

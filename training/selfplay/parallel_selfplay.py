@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -945,7 +946,28 @@ class ParallelSelfPlayPool:
                 pos_bar.update(batch_size)
                 pending_slots = []
                 for _ in range(n_workers):
-                    msg = result_queue.get(timeout=120)
+                    # Poll with short timeout so we can check worker health
+                    while True:
+                        try:
+                            msg = result_queue.get(timeout=10)
+                            break
+                        except queue.Empty:
+                            # Check if any worker process died
+                            dead = [
+                                (i, p.exitcode)
+                                for i, p in enumerate(self.workers)
+                                if not p.is_alive()
+                            ]
+                            if dead:
+                                info = ", ".join(
+                                    f"worker {i} exit={c}"
+                                    for i, c in dead
+                                )
+                                raise RuntimeError(
+                                    f"Worker process(es) died: {info}. "
+                                    f"Likely a segfault in Cython code "
+                                    f"or out-of-memory kill."
+                                )
                     if msg[0] == 'error':
                         raise RuntimeError(
                             f"Worker {msg[1]} failed:\n{msg[2]}")
@@ -1013,9 +1035,19 @@ class ParallelSelfPlayPool:
             sync['tree_results_ready'].set()
             for ev in sync['deltas_ready']:
                 ev.set()
+            # Abort worker barrier to unblock workers stuck in wb.wait()
+            try:
+                sync['worker_barrier'].abort()
+            except Exception:
+                pass
             # Wait for all workers to reach round-end barrier
             try:
                 self._round_end_barrier.wait(timeout=10)
+            except Exception:
+                pass
+            # Reset barrier for next round
+            try:
+                sync['worker_barrier'].reset()
             except Exception:
                 pass
             # Reset sync state for next round
@@ -1177,7 +1209,10 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                                 slot.game.board, slot.game.current_player)
                     shared_bufs.tree_needs_init[gi] = True
 
-            wb.wait()
+            try:
+                wb.wait()
+            except BrokenBarrierError:
+                break
             if worker_id == 0:
                 tree_request_ready.set()
 
@@ -1204,7 +1239,10 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                         next_dist_frac=ndf,
                     )
 
-            wb.wait()
+            try:
+                wb.wait()
+            except BrokenBarrierError:
+                break
             if worker_id == 0:
                 tree_request_ready.clear()
                 tree_results_ready.clear()

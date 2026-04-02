@@ -521,10 +521,18 @@ def compute_selfplay_loss(value_pred, pair_logits, moves_left_pred, chain_pred,
     masked = chain_diff_sq * chain_mask
     chain_loss = masked.sum() / chain_mask.sum().clamp(min=1)
 
+    # Decisive-only value loss (for reporting, not used in total)
+    decisive_mask = ~draw_mask
+    if decisive_mask.any():
+        decisive_vloss = F.mse_loss(value_pred[decisive_mask],
+                                    value_target[decisive_mask])
+    else:
+        decisive_vloss = torch.zeros(1, device=value_pred.device).squeeze()
+
     total = (value_weight * value_loss + policy_loss
              + 0.1 * ml_loss + 0.1 * chain_loss)
 
-    return total, value_loss, policy_loss, ml_loss, chain_loss
+    return total, value_loss, policy_loss, ml_loss, chain_loss, decisive_vloss
 
 
 def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
@@ -545,6 +553,7 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
     total_ploss = 0.0
     total_ml_loss = 0.0
     total_chain_loss = 0.0
+    total_decisive_vloss = 0.0
     total_entropy = 0.0
     n_batches = 0
 
@@ -564,7 +573,7 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
         if use_amp:
             with torch.amp.autocast("cuda"):
                 value_pred, pair_logits, ml_pred, chain_pred = model(planes)
-                loss, vloss, ploss, ml_loss, cl = compute_selfplay_loss(
+                loss, vloss, ploss, ml_loss, cl, dvloss = compute_selfplay_loss(
                     value_pred, pair_logits, ml_pred, chain_pred,
                     visit_dist, value_target, ml_target, drawn,
                     chain_target, chain_mask,
@@ -576,7 +585,7 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
             scaler.update()
         else:
             value_pred, pair_logits, ml_pred, chain_pred = model(planes)
-            loss, vloss, ploss, ml_loss, cl = compute_selfplay_loss(
+            loss, vloss, ploss, ml_loss, cl, dvloss = compute_selfplay_loss(
                 value_pred, pair_logits, ml_pred, chain_pred,
                 visit_dist, value_target, ml_target, drawn,
                 chain_target, chain_mask,
@@ -596,11 +605,13 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
         total_ploss += ploss.item()
         total_ml_loss += ml_loss.item()
         total_chain_loss += cl.item()
+        total_decisive_vloss += dvloss.item()
         n_batches += 1
 
     d = max(n_batches, 1)
     return (total_loss / d, total_vloss / d, total_ploss / d,
-            total_ml_loss / d, total_chain_loss / d, total_entropy / d)
+            total_ml_loss / d, total_chain_loss / d, total_entropy / d,
+            total_decisive_vloss / d)
 
 
 # ---------------------------------------------------------------------------
@@ -1032,6 +1043,8 @@ def main():
                         help="Number of worker processes for parallel self-play")
     parser.add_argument("--evaluate", action="store_true",
                         help="Run evaluation immediately on startup before training")
+    parser.add_argument("--no-eval", action="store_true",
+                        help="Skip periodic evaluation during training")
     parser.add_argument("--refresh", action="store_true",
                         help="Delete all selfplay data, checkpoints, and wandb logs, "
                              "then restart from --resume model weights")
@@ -1245,7 +1258,7 @@ def main():
                     max_cand_dist=max_cand_dist,
                     next_dist_frac=next_dist_frac,
                 )
-                examples, draw_rate, a_win_rate, avg_moves = \
+                examples, draw_rate, a_win_rate, avg_moves, far_pct = \
                     manager.generate(round_num)
                 manager.save_round(examples, round_num, args.data_dir)
 
@@ -1276,9 +1289,10 @@ def main():
                 scaler=scaler,
                 value_weight=args.value_weight,
             )
-            avg_loss, avg_vloss, avg_ploss, avg_ml, avg_chain, avg_entropy = losses
+            avg_loss, avg_vloss, avg_ploss, avg_ml, avg_chain, avg_entropy, avg_dvloss = losses
             t_train = time.time() - t1
             print(f"  Loss: {avg_loss:.4f} (value={avg_vloss:.4f}, "
+                  f"decisive_value={avg_dvloss:.4f}, "
                   f"policy={avg_ploss:.4f}, ml={avg_ml:.4f}, "
                   f"chain={avg_chain:.4f}, entropy={avg_entropy:.4f})")
 
@@ -1291,7 +1305,7 @@ def main():
             eval_result = None
             win_rate = None
             t_eval = 0.0
-            if (round_num + 1) % args.eval_every == 0:
+            if not args.no_eval and (round_num + 1) % args.eval_every == 0:
                 center = (crossover_time if crossover_time is not None
                           else args.minimax_time)
                 print(f"\n--- Evaluation: {args.eval_games} games, "
@@ -1316,6 +1330,7 @@ def main():
             print(f"\n  Round {round_num} summary:")
             print(f"    Examples: {len(examples):,}")
             print(f"    Draw rate: {100 * draw_rate:.1f}%")
+            print(f"    Far moves (>dist 2): {far_pct:.1f}%")
             print(f"    Loss: {avg_loss:.4f}")
             if eval_result is not None:
                 print(f"    Crossover time: {crossover_time:.4f}s")
@@ -1330,6 +1345,7 @@ def main():
                     "round": round_num,
                     "loss": avg_loss,
                     "value_loss": avg_vloss,
+                    "decisive_value_loss": avg_dvloss,
                     "policy_loss": avg_ploss,
                     "moves_left_loss": avg_ml,
                     "chain_loss": avg_chain,
@@ -1338,6 +1354,7 @@ def main():
                     "draw_rate": draw_rate,
                     "a_win_pct": a_win_rate,
                     "avg_moves": avg_moves,
+                    "far_move_pct": far_pct,
                     "noise_dist_scale": noise_dist_scale,
                     "examples": len(examples),
                     "time_gen": t_gen,
