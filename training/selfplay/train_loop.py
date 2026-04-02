@@ -620,15 +620,16 @@ def _eval_minimax_worker(args):
 @torch.no_grad()
 def evaluate_vs_minimax(model, device, n_games: int = 100,
                         n_sims: int = 200, minimax_time: float = 0.1) -> dict:
-    """Play MCTSBot vs MinimaxBot with batched GPU eval across all games.
+    """Play MCTSBot vs MinimaxBot on an infinite grid.
 
+    MCTS uses zero-padded convolutions and dynamic board sizing (min 25×25).
     Returns dict with wins, losses, draws, and score (W=1, D=0.5, L=0).
     """
     from mcts.tree import (
-        create_trees_batched, select_leaf, expand_and_backprop,
+        create_tree_dynamic, select_leaf, expand_and_backprop,
         maybe_expand_leaf, select_move_pair, select_single_move,
     )
-    from game import ToroidalHexGame, TORUS_SIZE
+    from model.resnet import board_to_planes
 
     try:
         import ai_cpp
@@ -640,15 +641,16 @@ def evaluate_vs_minimax(model, device, n_games: int = 100,
     _is_pair = getattr(minimax_bot, 'pair_moves', False)
 
     model.eval()
-    model_dtype = next(model.parameters()).dtype
-    ANCHOR = TORUS_SIZE // 2
+
+    # Switch to zero padding for evaluation
+    model.set_padding_mode('zeros')
 
     # Process pool for parallel minimax (GIL blocks threads)
     from multiprocessing import Pool as ProcPool
     n_workers = min(n_games, os.cpu_count() or 8)
     proc_pool = ProcPool(n_workers)
 
-    # All games run in parallel
+    # All games run on infinite grid
     games = [HexGame() for _ in range(n_games)]
     mcts_side = [Player.A if i % 2 == 0 else Player.B for i in range(n_games)]
     active = set(range(n_games))
@@ -690,7 +692,7 @@ def evaluate_vs_minimax(model, device, n_games: int = 100,
         if not active:
             break
 
-        # --- Batched MCTS turns ---
+        # --- MCTS turns (per-game, dynamic board size, zero padding) ---
         mcts_idx = [i for i in sorted(active)
                     if games[i].current_player == mcts_side[i]
                     and not games[i].game_over]
@@ -710,91 +712,79 @@ def evaluate_vs_minimax(model, device, n_games: int = 100,
         if not need_mcts:
             continue
 
-        # Convert to toroidal for MCTS
-        torus_games = [
-            ToroidalHexGame.from_hex_game(games[i], ANCHOR, ANCHOR)
-            for i in need_mcts
-        ]
+        # Create trees with dynamic sizing (no torus)
+        trees = []
+        offsets = []  # (off_q, off_r) per game
+        proxy_games = []  # lightweight game proxies for MCTS select_leaf
+        for i in need_mcts:
+            tree, off_q, off_r = create_tree_dynamic(
+                games[i], model, device, add_noise=False,
+                min_size=BOARD_SIZE)
+            trees.append(tree)
+            offsets.append((off_q, off_r))
+            # Build a proxy game object for select_leaf (needs board + make_move)
+            # Use a simple namespace with the grid-mapped board
+            from game import ToroidalHexGame
+            proxy = ToroidalHexGame(win_length=games[i].win_length)
+            proxy.board = {}
+            for (rq, rr), player in games[i].board.items():
+                proxy.board[(rq + off_q, rr + off_r)] = player
+            proxy.current_player = games[i].current_player
+            proxy.moves_left_in_turn = games[i].moves_left_in_turn
+            proxy.move_count = games[i].move_count
+            proxy.winner = games[i].winner
+            proxy.game_over = games[i].game_over
+            proxy_games.append(proxy)
+
         B = len(need_mcts)
 
-        # Batch create trees (one GPU forward pass)
-        trees = create_trees_batched(torus_games, model, device, add_noise=False)
-
-        # Batch sims
-        eval_buf = torch.empty(B, 2, BOARD_SIZE, BOARD_SIZE, dtype=model_dtype)
-
+        # Run sims (per-game since board sizes may differ)
         for _sim in range(n_sims):
-            leaves = [select_leaf(trees[j], torus_games[j]) for j in range(B)]
-
-            # Collect non-terminal leaves needing NN eval
-            eval_list = [(j, leaves[j]) for j in range(B)
-                         if not leaves[j].is_terminal and leaves[j].deltas]
-
-            eval_map = {}
-            vals_cpu = []
-            expand_data = {}
-
-            if eval_list:
-                n_eval = len(eval_list)
-                batch = eval_buf[:n_eval]
-                for k, (j, leaf) in enumerate(eval_list):
-                    rp = trees[j].root_planes
-                    if leaf.player_flipped:
-                        batch[k, 0] = rp[1]
-                        batch[k, 1] = rp[0]
-                    else:
-                        batch[k] = rp
-                    for gq, gr, ch in leaf.deltas:
-                        actual_ch = (1 - ch) if leaf.player_flipped else ch
-                        batch[k, actual_ch, gq, gr] = 1.0
-
-                batch_gpu = batch.to(device, non_blocking=True)
-                values, pair_logits, _, _ = model(batch_gpu)
-                vals_cpu = values.cpu().tolist()
-
-                # Expansion data for leaves that need it
-                need_expand = [k for k, (_, lf) in enumerate(eval_list)
-                               if lf.needs_expansion]
-                if need_expand:
-                    ne = len(need_expand)
-                    exp_logits = pair_logits[need_expand]
-                    flat_logits = exp_logits.reshape(ne, -1)
-                    top_raw, top_idxs = flat_logits.topk(200, dim=-1)
-                    top_vals = F.softmax(top_raw, dim=-1)
-                    marg_logits = exp_logits.logsumexp(dim=-1)
-                    margs = F.softmax(marg_logits, dim=-1).cpu()
-                    top_idxs_cpu = top_idxs.cpu()
-                    top_vals_cpu = top_vals.cpu()
-                    for kk, idx in enumerate(need_expand):
-                        expand_data[idx] = (
-                            margs[kk], top_idxs_cpu[kk], top_vals_cpu[kk])
-                del pair_logits
-
-                eval_map = {j: k for k, (j, _) in enumerate(eval_list)}
-
-            # Backprop
-            for j, leaf in enumerate(leaves):
-                k = eval_map.get(j)
+            for j in range(B):
+                leaf = select_leaf(trees[j], proxy_games[j])
                 if leaf.is_terminal:
                     expand_and_backprop(trees[j], leaf, 0.0)
-                elif k is not None:
-                    expand_and_backprop(trees[j], leaf, vals_cpu[k])
-                    data = expand_data.get(k)
-                    if data is not None:
-                        maybe_expand_leaf(trees[j], leaf, *data)
-                else:
+                    continue
+                if not leaf.deltas:
                     expand_and_backprop(trees[j], leaf, 0.0)
+                    continue
 
-        # Select moves and apply to real games
+                # NN eval for this leaf
+                rp = trees[j].root_planes.clone()
+                if leaf.player_flipped:
+                    rp = rp.flip(0)
+                for gq, gr, ch in leaf.deltas:
+                    actual_ch = (1 - ch) if leaf.player_flipped else ch
+                    rp[actual_ch, gq, gr] = 1.0
+
+                x = rp.unsqueeze(0).to(device)
+                values, pair_logits, _, _ = model(x)
+                nn_val = values[0].item()
+                expand_and_backprop(trees[j], leaf, nn_val)
+
+                if leaf.needs_expansion:
+                    logits = pair_logits[0]
+                    flat = logits.reshape(-1)
+                    top_raw, top_idxs = flat.topk(min(200, flat.shape[0]))
+                    top_vals = F.softmax(top_raw, dim=0)
+                    marg_logits = logits.logsumexp(dim=-1)
+                    marginal = F.softmax(marg_logits, dim=0).cpu()
+                    maybe_expand_leaf(
+                        trees[j], leaf, marginal,
+                        top_idxs.cpu(), top_vals.cpu(),
+                        nn_value=nn_val)
+
+        # Select moves and convert back to infinite grid coords
         for j, i in enumerate(need_mcts):
+            off_q, off_r = offsets[j]
             if games[i].moves_left_in_turn == 1:
-                tq, tr = select_single_move(trees[j])
-                real_moves = [(tq - ANCHOR, tr - ANCHOR)]
+                gq, gr = select_single_move(trees[j])
+                real_moves = [(gq - off_q, gr - off_r)]
             else:
-                (t1q, t1r), (t2q, t2r) = select_move_pair(
+                (g1q, g1r), (g2q, g2r) = select_move_pair(
                     trees[j], temperature=0.1)
-                real_moves = [(t1q - ANCHOR, t1r - ANCHOR),
-                              (t2q - ANCHOR, t2r - ANCHOR)]
+                real_moves = [(g1q - off_q, g1r - off_r),
+                              (g2q - off_q, g2r - off_r)]
 
             for q, r in real_moves:
                 if not games[i].game_over:
@@ -808,6 +798,9 @@ def evaluate_vs_minimax(model, device, n_games: int = 100,
                 w, l, d = _eval_result(games[i], mcts_side[i])
                 wins += w; losses += l; draws += d
                 pbar.update(1)
+
+    # Restore circular padding for training
+    model.set_padding_mode('circular')
 
     proc_pool.terminate()
     proc_pool.join()

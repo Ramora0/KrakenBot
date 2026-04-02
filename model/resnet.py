@@ -157,20 +157,29 @@ class HexResNet(nn.Module):
         """
         return pair_logits.logsumexp(dim=-1)
 
+    def set_padding_mode(self, mode: str):
+        """Switch all Conv2d layers between 'circular' and 'zeros'."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                m.padding_mode = mode
 
-def board_to_planes(board_dict, current_player, pad_to=None):
+
+def board_to_planes(board_dict, current_player, pad_to=None, min_size=None,
+                    margin=6):
     """Convert {(q,r): player_int} board to planes tensor.
 
     Channel 0: current player's stones.
     Channel 1: opponent's stones.
 
     If pad_to is given, centers in a (pad_to x pad_to) grid.
-    Otherwise uses tight bounding box + 6-cell margin on each side.
+    Otherwise uses tight bounding box + *margin*-cell margin on each side,
+    clamped to at least *min_size* × *min_size*.
 
     Returns (planes, offset_q, offset_r, board_h, board_w).
     """
+    cp = current_player.value if hasattr(current_player, 'value') else current_player
     if not board_dict:
-        size = pad_to or 13
+        size = pad_to or min_size or 13
         return torch.zeros(2, size, size), 0, 0, size, size
 
     qs = [q for q, _r in board_dict]
@@ -181,9 +190,11 @@ def board_to_planes(board_dict, current_player, pad_to=None):
     if pad_to is not None:
         h = w = pad_to
     else:
-        margin = 2
         h = max_q - min_q + 1 + 2 * margin
         w = max_r - min_r + 1 + 2 * margin
+        if min_size:
+            h = max(h, min_size)
+            w = max(w, min_size)
 
     off_q = (h - (max_q - min_q + 1)) // 2 - min_q
     off_r = (w - (max_r - min_r + 1)) // 2 - min_r
@@ -192,7 +203,8 @@ def board_to_planes(board_dict, current_player, pad_to=None):
     for (q, r), player in board_dict.items():
         gq = q + off_q
         gr = r + off_r
-        if player == current_player:
+        pv = player.value if hasattr(player, 'value') else player
+        if pv == cp:
             planes[0, gq, gr] = 1.0
         else:
             planes[1, gq, gr] = 1.0

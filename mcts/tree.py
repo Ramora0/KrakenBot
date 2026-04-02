@@ -185,18 +185,20 @@ class MCTSTree:
     noise_dist_scale: float = 0.0            # for distance-aware exploration noise
     max_cand_dist: int | None = None         # distance gate for candidates
     next_dist_frac: float = 0.0              # interpolation fraction for next ring
+    board_width: int = BOARD_SIZE            # width of the board (for dynamic sizing)
+    n_cells: int = N_CELLS                   # board_width ** 2
 
 
 # ---------------------------------------------------------------------------
 # Coordinate helpers (torus -- no offsets)
 # ---------------------------------------------------------------------------
 
-def _cell_to_idx(q: int, r: int) -> int:
-    return q * BOARD_SIZE + r
+def _cell_to_idx(q: int, r: int, width: int = BOARD_SIZE) -> int:
+    return q * width + r
 
 
-def _idx_to_cell(idx: int) -> tuple[int, int]:
-    return idx // BOARD_SIZE, idx % BOARD_SIZE
+def _idx_to_cell(idx: int, width: int = BOARD_SIZE) -> tuple[int, int]:
+    return idx // width, idx % width
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +551,82 @@ def create_trees_batched(
     return trees
 
 
+@torch.no_grad()
+def create_tree_dynamic(
+    game,
+    model: torch.nn.Module,
+    device: torch.device,
+    add_noise: bool = False,
+    min_size: int = BOARD_SIZE,
+    margin: int = 6,
+) -> tuple[MCTSTree, int, int]:
+    """Create an MCTS tree for an infinite-grid game with dynamic board size.
+
+    Computes a bounding box around stones, pads by *margin*, clamps to
+    at least *min_size* × *min_size*, and runs the model on that grid.
+    No distance gating is applied (evaluation uses full candidate set).
+
+    Returns (tree, offset_q, offset_r) where offsets map grid coords back
+    to real coords via real_q = grid_q - offset_q.
+    """
+    from model.resnet import board_to_planes
+
+    planes, off_q, off_r, h, w = board_to_planes(
+        game.board, game.current_player, min_size=min_size, margin=margin)
+
+    bw = w  # board width for this tree
+    nc = h * w  # n_cells
+
+    x = planes.unsqueeze(0).to(device)
+    value, pair_logits, _, _ = model(x)
+
+    root_value = value[0].item()
+    pair_probs = F.softmax(pair_logits[0].reshape(-1), dim=0).reshape(nc, nc).cpu()
+    marginal = pair_probs.sum(dim=-1)
+
+    # Build candidate set: all cells in grid that are empty
+    occupied_grid = set()
+    for (q, r) in game.board:
+        occupied_grid.add((q + off_q, r + off_r))
+
+    all_cells = {(gq, gr) for gq in range(h) for gr in range(w)}
+    cands = all_cells - occupied_grid
+
+    cand_indices = [gq * bw + gr for gq, gr in cands]
+    cand_values = marginal[cand_indices].tolist()
+    cand_priors = list(zip(cand_indices, cand_values))
+    cand_priors.sort(key=lambda x: x[1], reverse=True)
+
+    pos = PosNode()
+    pos.value = root_value
+    cp = game.current_player
+    if hasattr(cp, 'value'):
+        pos.player = cp
+    else:
+        pos.player = Player(cp)
+    pos.is_root = True
+    pos._marginal = marginal
+
+    _init_node_children(pos.move_node, cand_priors)
+    if add_noise:
+        _add_exploration_noise(pos.move_node)
+
+    root_player = cp if hasattr(cp, 'value') else Player(cp)
+    occupied_frozen = frozenset(occupied_grid)
+
+    tree = MCTSTree(
+        root_pos=pos,
+        pair_probs=pair_probs,
+        root_planes=planes,
+        root_player=root_player,
+        root_value=root_value,
+        root_occupied=occupied_frozen,
+        board_width=bw,
+        n_cells=nc,
+    )
+    return tree, off_q, off_r
+
+
 def compute_max_cand_dist(round_num: int) -> tuple[int | None, float]:
     """Distance gate for the given self-play round.
 
@@ -585,17 +663,19 @@ def _expand_level2(
     cond_probs = tree.pair_probs[stone1_idx]  # [N_CELLS]
 
     # All empty cells except stone_1, filtered by distance
+    _bw = tree.board_width
+    _nc = tree.n_cells
     if tree.max_cand_dist is not None:
         occ_idx = set(
-            _cell_to_idx(q, r) for q, r in tree.root_occupied
+            _cell_to_idx(q, r, _bw) for q, r in tree.root_occupied
         ) | {stone1_idx}
         cand_indices = list(
             _nearby_candidates(occ_idx, tree.max_cand_dist,
                                tree.next_dist_frac))
     else:
-        occ_set = set(_cell_to_idx(q, r) for q, r in tree.root_occupied)
+        occ_set = set(_cell_to_idx(q, r, _bw) for q, r in tree.root_occupied)
         occ_set.add(stone1_idx)
-        cand_indices = [i for i in range(N_CELLS) if i not in occ_set]
+        cand_indices = [i for i in range(_nc) if i not in occ_set]
 
     cand_values = cond_probs[cand_indices].tolist()
     cand_priors = list(zip(cand_indices, cand_values))
@@ -640,6 +720,7 @@ def select_leaf(tree: MCTSTree, game) -> LeafInfo:
     depth = 0
     root_cp = tree.root_player
     root_fpu = tree.root_value - FPU_REDUCTION
+    _bw = tree.board_width
 
     while depth < MAX_DEPTH:
         if pos.is_root:
@@ -647,7 +728,7 @@ def select_leaf(tree: MCTSTree, game) -> LeafInfo:
 
             # Level 1: select stone_1
             s1_idx = _puct_select(pos.move_node, fpu=root_fpu)
-            s1_q, s1_r = _idx_to_cell(s1_idx)
+            s1_q, s1_r = _idx_to_cell(s1_idx, _bw)
 
             path.append((pos.move_node, s1_idx))
             pair_depths.append(depth)
@@ -693,7 +774,7 @@ def select_leaf(tree: MCTSTree, game) -> LeafInfo:
                     player_flipped=(cp != root_cp))
 
             s2_idx = _puct_select(l2_node, fpu=root_fpu)
-            s2_q, s2_r = _idx_to_cell(s2_idx)
+            s2_q, s2_r = _idx_to_cell(s2_idx, _bw)
 
             path.append((l2_node, s2_idx))
             pair_depths.append(depth)
@@ -740,10 +821,12 @@ def select_leaf(tree: MCTSTree, game) -> LeafInfo:
 
             child_fpu = pos.value - FPU_REDUCTION
             pair_action = _puct_select(pos.move_node, fpu=child_fpu)
-            s1_idx = pair_action // N_CELLS
-            s2_idx = pair_action % N_CELLS
-            s1_q, s1_r = _idx_to_cell(s1_idx)
-            s2_q, s2_r = _idx_to_cell(s2_idx)
+            _nc = tree.n_cells
+            _bw = tree.board_width
+            s1_idx = pair_action // _nc
+            s2_idx = pair_action % _nc
+            s1_q, s1_r = _idx_to_cell(s1_idx, _bw)
+            s2_q, s2_r = _idx_to_cell(s2_idx, _bw)
 
             path.append((pos.move_node, pair_action))
             pair_depths.append(depth)
@@ -885,16 +968,18 @@ def maybe_expand_leaf(
         return
 
     # Occupied cells at leaf position
-    occupied_idx = {_cell_to_idx(q, r) for q, r in tree.root_occupied}
+    _bw = tree.board_width
+    occupied_idx = {_cell_to_idx(q, r, _bw) for q, r in tree.root_occupied}
     for q, r, _ch in leaf.deltas:
-        occupied_idx.add(_cell_to_idx(q, r))
+        occupied_idx.add(_cell_to_idx(q, r, _bw))
 
     # Filter top pairs: exclude occupied cells, self-pairs
+    _nc = tree.n_cells
     actions_priors = []
     for idx_val, prob_val in zip(top_pair_indices.tolist(),
                                  top_pair_values.tolist()):
-        s1 = idx_val // N_CELLS
-        s2 = idx_val % N_CELLS
+        s1 = idx_val // _nc
+        s2 = idx_val % _nc
         if s1 == s2 or s1 in occupied_idx or s2 in occupied_idx:
             continue
         actions_priors.append((idx_val, prob_val))
@@ -962,17 +1047,18 @@ def select_move_pair(
 
     Returns ((q1,r1), (q2,r2)) in torus coordinates.
     """
+    _bw = tree.board_width
     pair_visits = get_pair_visits(tree)
     if not pair_visits:
         # Fallback: best stone_1 by visits
         root = tree.root_pos.move_node
         best_local = max(range(root.n), key=lambda i: root.visits[i])
         best_s1 = root.actions[best_local]
-        s1_cell = _idx_to_cell(best_s1)
+        s1_cell = _idx_to_cell(best_s1, _bw)
         l2 = root.level2.get(best_s1) if root.level2 else None
         if l2 is not None and l2.actions is not None:
             best_l2 = max(range(l2.n), key=lambda i: l2.visits[i])
-            s2_cell = _idx_to_cell(l2.actions[best_l2])
+            s2_cell = _idx_to_cell(l2.actions[best_l2], _bw)
         else:
             s2_cell = s1_cell
         return s1_cell, s2_cell
@@ -988,8 +1074,8 @@ def select_move_pair(
         best_idx = torch.multinomial(probs, 1).item()
 
     s1_idx, s2_idx = pairs[best_idx]
-    s1_cell = _idx_to_cell(s1_idx)
-    s2_cell = _idx_to_cell(s2_idx)
+    s1_cell = _idx_to_cell(s1_idx, _bw)
+    s2_cell = _idx_to_cell(s2_idx, _bw)
     return s1_cell, s2_cell
 
 
@@ -997,4 +1083,4 @@ def select_single_move(tree: MCTSTree) -> tuple[int, int]:
     """Select a single move (for moves_left == 1) from marginalized visits."""
     root = tree.root_pos.move_node
     best_local = max(range(root.n), key=lambda i: root.visits[i])
-    return _idx_to_cell(root.actions[best_local])
+    return _idx_to_cell(root.actions[best_local], tree.board_width)
