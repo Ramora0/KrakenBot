@@ -611,9 +611,10 @@ def _eval_minimax_worker(args):
     """Process pool worker: run minimax get_move on a game."""
     bot, game = args
     try:
-        return bot.get_move(game)
+        move = bot.get_move(game)
+        return move, bot.last_depth
     except Exception:
-        return None
+        return None, 0
 
 
 @torch.no_grad()
@@ -653,6 +654,7 @@ def evaluate_vs_minimax(model, device, n_games: int = 100,
     active = set(range(n_games))
     move_counts = [0] * n_games
     wins = losses = draws = 0
+    minimax_depths = []
 
     pbar = tqdm(total=n_games, desc="Evaluating", unit="game")
 
@@ -664,11 +666,13 @@ def evaluate_vs_minimax(model, device, n_games: int = 100,
                           and games[i].current_player != mcts_side[i]]
 
         if minimax_needed:
-            args = [(minimax_bot, games[i]) for i in minimax_needed]
-            results = proc_pool.map(_eval_minimax_worker, args)
-            for i, result in zip(minimax_needed, results):
+            worker_args = [(minimax_bot, games[i]) for i in minimax_needed]
+            results = proc_pool.map(_eval_minimax_worker, worker_args)
+            for i, (result, depth) in zip(minimax_needed, results):
                 if result is None:
                     continue
+                if depth > 0:
+                    minimax_depths.append(depth)
                 moves = result if _is_pair else [result]
                 for q, r in moves:
                     if not games[i].game_over:
@@ -810,9 +814,13 @@ def evaluate_vs_minimax(model, device, n_games: int = 100,
     pbar.close()
     total = max(wins + losses + draws, 1)
     score = (wins + 0.5 * draws) / total
+    avg_depth = sum(minimax_depths) / len(minimax_depths) if minimax_depths else 0
+    max_depth = max(minimax_depths) if minimax_depths else 0
     print(f"  MCTSBot vs Minimax({minimax_time:.3f}s): {wins}W / {losses}L / {draws}D "
-          f"= {100 * score:.1f}% score")
-    return {"wins": wins, "losses": losses, "draws": draws, "score": score}
+          f"= {100 * score:.1f}% score  "
+          f"(minimax depth: avg={avg_depth:.1f}, max={max_depth})")
+    return {"wins": wins, "losses": losses, "draws": draws, "score": score,
+            "minimax_avg_depth": avg_depth, "minimax_max_depth": max_depth}
 
 
 def _eval_result(game, mcts_player):
@@ -1031,7 +1039,20 @@ def main():
                         help="Number of worker processes for parallel self-play")
     parser.add_argument("--evaluate", action="store_true",
                         help="Run evaluation immediately on startup before training")
+    parser.add_argument("--refresh", action="store_true",
+                        help="Delete all selfplay data, checkpoints, and wandb logs, "
+                             "then restart from --resume model weights")
     args = parser.parse_args()
+
+    if args.refresh:
+        if not args.resume:
+            parser.error("--refresh requires --resume to specify the model to restart from")
+        import shutil
+        for d in [args.data_dir, args.output_dir, "wandb"]:
+            if os.path.isdir(d):
+                shutil.rmtree(d)
+                print(f"Deleted {d}/")
+        print(f"Refresh: restarting from {args.resume}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -1060,7 +1081,7 @@ def main():
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         # Only load optimizer/scaler from own checkpoints (have "round" key),
         # not from distillation checkpoints which use a different optimizer.
-        if "round" in ckpt:
+        if "round" in ckpt and not args.refresh:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             if scaler and ckpt.get("scaler_state_dict"):
                 scaler.load_state_dict(ckpt["scaler_state_dict"])
@@ -1084,6 +1105,7 @@ def main():
         print(f"Auto-resumed from {ckpt_path} (round {start_round})")
 
     os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.data_dir, exist_ok=True)
 
     # wandb
     use_wandb = (not args.no_wandb) and HAS_WANDB
@@ -1110,8 +1132,6 @@ def main():
         from tools.game_viewer import GameViewer
         viewer = GameViewer(port=args.viewer_port)
         viewer.start()
-
-    os.makedirs(args.data_dir, exist_ok=True)
 
     # Run evaluation immediately if requested
     if args.evaluate:
@@ -1177,6 +1197,7 @@ def main():
 
             # --- 1. Self-play ---
             from training.selfplay.self_play import SelfPlayManager
+            from mcts.tree import compute_max_cand_dist
             print(f"\n--- Self-play ---")
             model.eval()
             model.bfloat16()
@@ -1188,6 +1209,14 @@ def main():
             else:
                 noise_dist_scale = (round_num - warmup) * args.noise_dist_anneal_rate
             print(f"  noise_dist_scale={noise_dist_scale:.2f}")
+
+            max_cand_dist, next_dist_frac = compute_max_cand_dist(round_num)
+            if max_cand_dist is not None:
+                dist_msg = (f"max_cand_dist={max_cand_dist}"
+                            f" +{next_dist_frac:.0%} of dist-{max_cand_dist+1}")
+            else:
+                dist_msg = "no limit"
+            print(f"  Distance gate: {dist_msg}")
 
             if use_parallel:
                 target = COLD_START_GAMES if (
@@ -1203,6 +1232,8 @@ def main():
                         noise_dist_scale=noise_dist_scale,
                         target=target,
                         viewer=viewer,
+                        max_cand_dist=max_cand_dist,
+                        next_dist_frac=next_dist_frac,
                     )
                 # Save examples
                 manager = SelfPlayManager(
@@ -1218,6 +1249,8 @@ def main():
                     late_temperature=args.late_temperature,
                     draw_penalty=args.draw_penalty,
                     noise_dist_scale=noise_dist_scale,
+                    max_cand_dist=max_cand_dist,
+                    next_dist_frac=next_dist_frac,
                 )
                 examples, draw_rate, a_win_rate, avg_moves = \
                     manager.generate(round_num)

@@ -6,8 +6,11 @@ from libc.math cimport sqrt
 cdef double PUCT_C = 0.8
 
 
-def puct_select(node, double c=PUCT_C):
-    """Select child with highest PUCT score. Returns action index."""
+def puct_select(node, double c=PUCT_C, double fpu=0.0):
+    """Select child with highest PUCT score. Returns action index.
+
+    *fpu* is the Q-value for unvisited children (First Play Urgency).
+    """
     cdef:
         int n = node.n
         list actions = node.actions
@@ -30,7 +33,7 @@ def puct_select(node, double c=PUCT_C):
             elif vc > 0:
                 q = <double>values[i] / vc
             else:
-                q = 0.0
+                q = fpu
             p = <double>priors[i]
             s = q + c_sqrt * p / (1 + vc)
             if s > best:
@@ -42,7 +45,7 @@ def puct_select(node, double c=PUCT_C):
             if vc > 0:
                 q = <double>values[i] / vc
             else:
-                q = 0.0
+                q = fpu
             p = <double>priors[i]
             s = q + c_sqrt * p / (1 + vc)
             if s > best:

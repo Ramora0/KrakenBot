@@ -14,6 +14,8 @@ from game import HexGame, ToroidalHexGame, TORUS_SIZE
 from mcts.tree import N_CELLS, NON_ROOT_TOP_K
 from model.resnet import HexResNet
 
+_TORUS_CENTER = TORUS_SIZE // 2
+
 _DEFAULT_MODEL_PATH = os.path.join(
     os.path.dirname(__file__), "training", "resnet_results", "best.pt"
 )
@@ -56,7 +58,7 @@ class MCTSBot(Bot):
         return tq - _ANCHOR_Q, tr - _ANCHOR_R
 
     @torch.no_grad()
-    def get_move(self, game: HexGame) -> list[tuple[int, int]]:
+    def get_move(self, game) -> list[tuple[int, int]]:
         from mcts.tree import (
             create_tree, select_leaf, expand_and_backprop,
             maybe_expand_leaf, select_move_pair, select_single_move,
@@ -64,14 +66,20 @@ class MCTSBot(Bot):
 
         self.last_depth = self.n_sims
         self._nodes = 0
+        is_torus = isinstance(game, ToroidalHexGame)
 
-        # Empty board: always play (0, 0)
+        # Empty board: always play center
         if not game.board:
+            if is_torus:
+                return [(_TORUS_CENTER, _TORUS_CENTER)]
             return [(0, 0)]
 
-        # Translate real game to toroidal game
-        torus_game = ToroidalHexGame.from_hex_game(
-            game, anchor_q=_ANCHOR_Q, anchor_r=_ANCHOR_R)
+        # Translate real game to toroidal game (skip if already torus)
+        if is_torus:
+            torus_game = game
+        else:
+            torus_game = ToroidalHexGame.from_hex_game(
+                game, anchor_q=_ANCHOR_Q, anchor_r=_ANCHOR_R)
 
         # Create tree (1 NN eval)
         tree = create_tree(torus_game, self.model, self.device, add_noise=False)
@@ -111,10 +119,14 @@ class MCTSBot(Bot):
         # Select move and translate back to real coords
         if game.moves_left_in_turn == 1:
             tq, tr = select_single_move(tree)
+            if is_torus:
+                return [(tq, tr)]
             rq, rr = self._torus_to_real(tq, tr)
             return [(rq, rr)]
         else:
             (t1q, t1r), (t2q, t2r) = select_move_pair(tree, temperature=0.1)
+            if is_torus:
+                return [(t1q, t1r), (t2q, t2r)]
             r1 = self._torus_to_real(t1q, t1r)
             r2 = self._torus_to_real(t2q, t2r)
             return [r1, r2]

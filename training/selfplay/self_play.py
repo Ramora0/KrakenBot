@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from mcts.tree import (
     MCTSTree, N_CELLS, NON_ROOT_TOP_K, create_trees_batched, select_leaf,
     expand_and_backprop, maybe_expand_leaf, get_pair_visits, get_single_visits,
-    select_move_pair, select_single_move,
+    select_move_pair, select_single_move, compute_max_cand_dist,
 )
 from model.resnet import BOARD_SIZE
 from game import ToroidalHexGame, TORUS_SIZE
@@ -60,7 +60,8 @@ class SelfPlayManager:
     def __init__(self, model, device, batch_size=256, n_sims=200,
                  data_dir="training/data/selfplay", viewer=None,
                  late_temperature=0.3, draw_penalty=0.1,
-                 noise_dist_scale=0.0):
+                 noise_dist_scale=0.0,
+                 max_cand_dist=None, next_dist_frac=0.0):
         self.model = model
         self.device = device
         self.batch_size = batch_size
@@ -70,6 +71,8 @@ class SelfPlayManager:
         self.late_temperature = late_temperature
         self.draw_penalty = draw_penalty
         self.noise_dist_scale = noise_dist_scale
+        self.max_cand_dist = max_cand_dist
+        self.next_dist_frac = next_dist_frac
 
     def _load_or_create_slots(self) -> tuple[list[SelfPlaySlot], int, bool]:
         """Load pending games from previous round, or create all fresh slots.
@@ -449,7 +452,9 @@ class SelfPlayManager:
             return
         games = [slots[i].game for i in active]
         trees = create_trees_batched(games, model, device, add_noise=True,
-                                     noise_dist_scale=self.noise_dist_scale)
+                                     noise_dist_scale=self.noise_dist_scale,
+                                     max_cand_dist=self.max_cand_dist,
+                                     next_dist_frac=self.next_dist_frac)
         for i, tree in zip(active, trees):
             slots[i].tree = tree
 
@@ -527,7 +532,8 @@ class SelfPlayManager:
                 _bp(group_slots[i].tree, leaf, nn_val)
                 data = expand_data.get(j)
                 if data is not None:
-                    maybe_expand_leaf(group_slots[i].tree, leaf, *data)
+                    maybe_expand_leaf(group_slots[i].tree, leaf, *data,
+                                     nn_value=nn_val)
             else:
                 _bp(group_slots[i].tree, leaf, 0.0)
 

@@ -35,12 +35,15 @@ def _game_summary(gdf: pd.DataFrame) -> dict:
     """Summary for a game from its DataFrame rows."""
     first = gdf.iloc[0]
     last = gdf.iloc[-1]
-    board = json.loads(last["board"])
+    # value_target is from current_player's perspective; convert to P1's
+    val = float(first["value_target"])
+    cp = int(first["current_player"])
+    p1_value = val if cp == 1 else -val
     return {
         "game_id": int(first["game_id"]),
         "turns": len(gdf),
         "moves": int(last["move_count"]),
-        "value": float(first["value_target"]),
+        "value": p1_value,
         "drawn": bool(first["game_drawn"]),
     }
 
@@ -69,10 +72,13 @@ def _game_detail(gdf: pd.DataFrame) -> dict:
             "moves_left": int(row["moves_left"]),
             "top_pairs": top_pairs,
         })
+    val = float(first["value_target"])
+    cp = int(first["current_player"])
+    p1_value = val if cp == 1 else -val
     return {
         "game_id": int(first["game_id"]),
         "round_id": int(first["round_id"]),
-        "value": float(first["value_target"]),
+        "value": p1_value,
         "drawn": bool(first["game_drawn"]),
         "turns": turns,
     }

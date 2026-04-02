@@ -29,6 +29,7 @@ from mcts.tree import (
     N_CELLS, select_leaf,
     expand_and_backprop, maybe_expand_leaf, get_pair_visits, get_single_visits,
     select_move_pair, select_single_move, _build_tree_from_eval,
+    compute_max_cand_dist,
 )
 from model.resnet import BOARD_SIZE
 
@@ -131,7 +132,7 @@ def _worker_fn(worker_id, n_workers, batch_size, n_sims,
                shared_bufs, sync, round_id,
                late_temperature, draw_penalty,
                noise_dist_scale,
-               result_queue):
+               result_queue, max_cand_dist=None, next_dist_frac=0.0):
     """Worker process: owns games/trees, does select + backprop."""
     try:
         _worker_loop(worker_id, n_workers, batch_size, n_sims,
@@ -139,7 +140,7 @@ def _worker_fn(worker_id, n_workers, batch_size, n_sims,
                      shared_bufs, sync, round_id,
                      late_temperature, draw_penalty,
                      noise_dist_scale,
-                     result_queue)
+                     result_queue, max_cand_dist, next_dist_frac)
     except Exception as e:
         sync['error'].value = 1
         result_queue.put(('error', worker_id, traceback.format_exc()))
@@ -155,7 +156,7 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                  shared_bufs, sync, round_id,
                  late_temperature, draw_penalty,
                  noise_dist_scale,
-                 result_queue):
+                 result_queue, max_cand_dist=None, next_dist_frac=0.0):
     """Inner worker loop (unwrapped for clean error handling)."""
     games_per_worker = batch_size // n_workers
     my_start = worker_id * games_per_worker
@@ -236,6 +237,8 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                     shared_bufs.tree_planes[gi].clone(),
                     add_noise=True,
                     noise_dist_scale=noise_dist_scale,
+                    max_cand_dist=max_cand_dist,
+                    next_dist_frac=next_dist_frac,
                 )
 
         # Step 5: barrier + clear events
@@ -286,7 +289,8 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                                 slot.tree, leaves[i],
                                 shared_bufs.marginals[gi],
                                 shared_bufs.top_indices[gi],
-                                shared_bufs.top_values[gi])
+                                shared_bufs.top_values[gi],
+                                nn_value=nn_val)
 
                 leaves = next_leaves
 
@@ -523,7 +527,8 @@ def _gpu_tree_forward(model, device, shared):
 
 def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
                       n_workers=8, late_temperature=0.3, draw_penalty=0.1,
-                      model_kwargs=None, viewer=None):
+                      model_kwargs=None, viewer=None, max_cand_dist=None,
+                      next_dist_frac=0.0):
     """Generate self-play games using multiprocessing.
 
     Returns (all_examples, draw_rate).
@@ -571,7 +576,7 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
                   game_dicts, next_game_id,
                   shared, sync, round_id,
                   late_temperature, draw_penalty,
-                  result_queue),
+                  result_queue, max_cand_dist, next_dist_frac),
         )
         p.start()
         workers.append(p)
@@ -794,6 +799,8 @@ class ParallelSelfPlayPool:
         self._draw_penalty = mp.Value('f', 0.1)
         self._noise_dist_scale = mp.Value('f', 0.0)
         self._round_stop = mp.Value('i', 0)
+        self._max_cand_dist = mp.Value('i', -1)  # -1 = no limit
+        self._next_dist_frac = mp.Value('f', 0.0)
         self._new_round = mp.Event()
         # Barrier for workers + main to sync at round end
         self._round_end_barrier = mp.Barrier(n_workers + 1)
@@ -819,6 +826,7 @@ class ParallelSelfPlayPool:
                       self._round_id, self._late_temperature,
                       self._draw_penalty, self._noise_dist_scale,
                       self._round_stop,
+                      self._max_cand_dist, self._next_dist_frac,
                       self._new_round, self._round_end_barrier,
                       self._next_game_id,
                       self.result_queue),
@@ -830,7 +838,8 @@ class ParallelSelfPlayPool:
     def generate_round(self, model, device, round_id, data_dir,
                        late_temperature=0.3, draw_penalty=0.1,
                        noise_dist_scale=0.0,
-                       target=None, viewer=None):
+                       target=None, viewer=None,
+                       max_cand_dist=None, next_dist_frac=0.0):
         """Run one round of self-play. Returns (examples, draw_rate)."""
         if not self._alive:
             raise RuntimeError("Pool not started")
@@ -844,6 +853,8 @@ class ParallelSelfPlayPool:
         self._draw_penalty.value = draw_penalty
         self._noise_dist_scale.value = noise_dist_scale
         self._round_stop.value = 0
+        self._max_cand_dist.value = max_cand_dist if max_cand_dist is not None else -1
+        self._next_dist_frac.value = next_dist_frac
 
         # Reset sync state for fresh round
         self.sync['error'].value = 0
@@ -1059,7 +1070,8 @@ def _pool_worker_fn(worker_id, n_workers, batch_size, n_sims,
                     shared_bufs, sync,
                     round_id_val, late_temp_val, draw_penalty_val,
                     noise_dist_scale_val,
-                    round_stop, new_round_event, round_end_barrier,
+                    round_stop, max_cand_dist_val, next_dist_frac_val,
+                    new_round_event, round_end_barrier,
                     next_game_id_shared,
                     result_queue):
     """Persistent worker: stays alive across rounds."""
@@ -1070,7 +1082,8 @@ def _pool_worker_fn(worker_id, n_workers, batch_size, n_sims,
             shared_bufs, sync,
             round_id_val, late_temp_val, draw_penalty_val,
             noise_dist_scale_val,
-            round_stop, new_round_event, round_end_barrier,
+            round_stop, max_cand_dist_val, next_dist_frac_val,
+            new_round_event, round_end_barrier,
             next_game_id_shared,
             result_queue)
     except Exception:
@@ -1091,7 +1104,8 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                       shared_bufs, sync,
                       round_id_val, late_temp_val, draw_penalty_val,
                       noise_dist_scale_val,
-                      round_stop, new_round_event, round_end_barrier,
+                      round_stop, max_cand_dist_val, next_dist_frac_val,
+                      new_round_event, round_end_barrier,
                       next_game_id_shared,
                       result_queue):
     """Inner loop for persistent pool worker."""
@@ -1175,6 +1189,9 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
             for i, slot in enumerate(slots):
                 gi = my_start + i
                 if shared_bufs.tree_needs_init[gi]:
+                    mcd = max_cand_dist_val.value
+                    mcd = None if mcd < 0 else mcd
+                    ndf = next_dist_frac_val.value
                     slot.tree = _build_tree_from_eval(
                         slot.game,
                         shared_bufs.tree_values[gi].item(),
@@ -1183,6 +1200,8 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                         shared_bufs.tree_planes[gi].clone(),
                         add_noise=True,
                         noise_dist_scale=noise_dist_scale,
+                        max_cand_dist=mcd,
+                        next_dist_frac=ndf,
                     )
 
             wb.wait()
@@ -1227,7 +1246,8 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                                     slot.tree, leaves[i],
                                     shared_bufs.marginals[gi],
                                     shared_bufs.top_indices[gi],
-                                    shared_bufs.top_values[gi])
+                                    shared_bufs.top_values[gi],
+                                    nn_value=nn_val)
 
                     leaves = next_leaves
 

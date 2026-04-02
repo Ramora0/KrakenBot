@@ -19,6 +19,7 @@ from mcts._puct_cy import puct_select as _puct_select
 # Import Python-level helpers that we call infrequently
 from mcts.tree import (
     _expand_level2, LeafInfo, EXPAND_VISITS, MAX_DEPTH, N_CELLS,
+    FPU_REDUCTION,
 )
 
 # ---------------------------------------------------------------------------
@@ -275,6 +276,8 @@ def select_leaf_cy(tree, game):
     cdef bint needs_exp
     cdef int root_cp_int = tree.root_player.value
     cdef int cp_int
+    cdef double root_fpu = tree.root_value - FPU_REDUCTION
+    cdef double child_fpu
 
     path = []
     pair_depths = []
@@ -285,7 +288,7 @@ def select_leaf_cy(tree, game):
         if pos.is_root:
             # ---- Root: two-level (stone_1 -> stone_2) ----
 
-            s1_idx = _puct_select(pos.move_node)
+            s1_idx = _puct_select(pos.move_node, fpu=root_fpu)
             s1_q = s1_idx // TORUS
             s1_r = s1_idx % TORUS
 
@@ -339,7 +342,7 @@ def select_leaf_cy(tree, game):
                     current_player=Player(cp_int), deltas=deltas,
                     player_flipped=(cp_int != root_cp_int))
 
-            s2_idx = _puct_select(l2_node)
+            s2_idx = _puct_select(l2_node, fpu=root_fpu)
             s2_q = s2_idx // TORUS
             s2_r = s2_idx % TORUS
 
@@ -393,7 +396,8 @@ def select_leaf_cy(tree, game):
         else:
             # ---- Non-root: flat pair selection ----
 
-            pair_action = _puct_select(pos.move_node)
+            child_fpu = pos.value - FPU_REDUCTION
+            pair_action = _puct_select(pos.move_node, fpu=child_fpu)
             s1_idx = pair_action // CELLS
             s2_idx = pair_action % CELLS
             s1_q = s1_idx // TORUS

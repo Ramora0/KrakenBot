@@ -1,3 +1,4 @@
 python -m training.distill.train_resnet --amp --epochs 3
 
 python -m training.selfplay.train_loop --resume training/distill/resnet_results/checkpoint.pt --amp
+python -m training.selfplay.train_loop --amp --evaluate --rounds 0 --resume training/mcts_results/best.pt --no-wandb --minimax-time .01
