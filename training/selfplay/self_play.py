@@ -285,7 +285,12 @@ class SelfPlayManager:
 
             for slot in slots:
                 turn_number = slot.turn_number
-                temperature = 1.0 if turn_number < 20 else self.late_temperature
+                if turn_number < 6:
+                    temperature = 2.5
+                elif turn_number < 20:
+                    temperature = 1.0
+                else:
+                    temperature = self.late_temperature
 
                 if slot.game.moves_left_in_turn == 1:
                     cell = select_single_move(slot.tree)
