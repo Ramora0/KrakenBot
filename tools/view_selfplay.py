@@ -56,21 +56,23 @@ def _game_detail(gdf: pd.DataFrame) -> dict:
         board = json.loads(row["board"])
         pv_raw = json.loads(row["pair_visits"])
         # decode pair visits: key "a,b" -> flat indices -> (q1,r1,q2,r2)
-        top_pairs = []
-        for k, v in sorted(pv_raw.items(), key=lambda x: -x[1])[:10]:
+        all_pairs = []
+        for k, v in sorted(pv_raw.items(), key=lambda x: -x[1]):
             a, b = k.split(",")
             a, b = int(a), int(b)
-            top_pairs.append({
+            all_pairs.append({
                 "q1": a // N, "r1": a % N,
                 "q2": b // N, "r2": b % N,
                 "v": v,
             })
+        top_pairs = all_pairs[:10]
         turns.append({
             "board": board,
             "player": int(row["current_player"]),
             "move_count": int(row["move_count"]),
             "moves_left": int(row["moves_left"]),
             "top_pairs": top_pairs,
+            "all_pairs": all_pairs,
         })
     val = float(first["value_target"])
     cp = int(first["current_player"])
@@ -296,6 +298,55 @@ main{display:flex;flex:1;overflow:hidden}
 #tl button:hover{background:#30363d}
 #tsl{flex:1;accent-color:#58a6ff;max-width:320px}
 #tlbl{font-size:12px;color:#8b949e;min-width:120px}
+
+/* visit detail panel */
+#vp{
+  width:320px;border-left:1px solid #30363d;
+  display:none;flex-direction:column;flex-shrink:0;
+  background:#0d1117;
+}
+#vp.open{display:flex}
+#vp h3{
+  font-size:11px;color:#8b949e;text-transform:uppercase;
+  letter-spacing:.8px;padding:10px 12px 4px;font-weight:500;
+}
+#vstats{
+  padding:4px 12px 8px;font-size:12px;color:#8b949e;
+  border-bottom:1px solid #30363d;display:flex;flex-direction:column;gap:3px;
+}
+#vstats b{color:#c9d1d9}
+#vtoggle{
+  display:flex;gap:6px;padding:6px 12px;border-bottom:1px solid #30363d;
+  align-items:center;
+}
+#vtoggle label{font-size:11px;color:#8b949e;cursor:pointer;display:flex;align-items:center;gap:4px}
+#vtoggle input{accent-color:#58a6ff}
+#vtabs{
+  display:flex;border-bottom:1px solid #30363d;
+}
+.vtab{
+  flex:1;text-align:center;padding:6px 0;font-size:11px;font-weight:600;
+  color:#8b949e;cursor:pointer;border-bottom:2px solid transparent;
+}
+.vtab:hover{color:#c9d1d9}
+.vtab.sel{color:#58a6ff;border-bottom-color:#58a6ff}
+#vlist{flex:1;overflow-y:auto;font-size:11px;font-variant-numeric:tabular-nums}
+.vrow{
+  display:flex;gap:4px;padding:3px 12px;align-items:center;
+  border-bottom:1px solid #161b22;
+}
+.vrow:hover{background:#161b22}
+.vrow .vr{min-width:24px;color:#8b949e;text-align:right}
+.vrow .vc{flex:1;color:#c9d1d9;font-weight:500}
+.vrow .vn{min-width:44px;text-align:right;color:#c9d1d9}
+.vrow .vpct{min-width:44px;text-align:right;color:#8b949e}
+.vbar{height:3px;border-radius:1px;margin-top:1px}
+#vpbtn{
+  background:#21262d;border:1px solid #30363d;color:#8b949e;
+  border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px;
+  font-weight:600;margin-left:auto;
+}
+#vpbtn:hover{background:#30363d;color:#c9d1d9}
 </style>
 </head>
 <body>
@@ -330,8 +381,21 @@ main{display:flex;flex:1;overflow:hidden}
       <button id="tbn" title="Next turn (Right)">&#x25B6;</button>
       <button id="tbe" title="Last turn (End)">&#x23ED;</button>
       <span id="tlbl"></span>
+      <button id="vpbtn" title="Toggle visit detail panel">Visits</button>
     </div>
     <div id="mv"></div>
+  </div>
+  <div id="vp">
+    <h3>Visit Distribution</h3>
+    <div id="vstats"></div>
+    <div id="vtoggle">
+      <label><input type="checkbox" id="heatmapCb"> Heatmap</label>
+    </div>
+    <div id="vtabs">
+      <div class="vtab sel" data-mode="pairs">Pairs</div>
+      <div class="vtab" data-mode="cells">Cells</div>
+    </div>
+    <div id="vlist"></div>
   </div>
 </main>
 
@@ -344,6 +408,8 @@ let games = [];
 let selGameId = null;
 let gameDetail = null;
 let curTurn = 0;
+let visitMode = 'pairs';
+let showHeatmap = false;
 
 /* ---- fetch helpers ---- */
 async function loadRounds() {
@@ -423,10 +489,24 @@ function hpts(cx, cy, sz) {
   return p;
 }
 
+/* ---- visit analysis helpers ---- */
+function computeCellMarginals(allPairs) {
+  const cells = new Map(); // "q,r" -> total visits
+  for (const p of allPairs) {
+    for (const [q,r] of [[p.q1,p.r1],[p.q2,p.r2]]) {
+      const k = q+','+r;
+      cells.set(k, (cells.get(k)||0) + p.v);
+    }
+  }
+  return cells;
+}
+
 /* ---- hex drawing ---- */
-function drawHex(boardDict, topPairs, player) {
+function drawHex(boardDict, topPairs, player, allPairs) {
   const svg = document.getElementById('bsvg');
   const sz = 12, szH = sz * .88;
+
+  const drawPairs = allPairs || topPairs || [];
 
   // Find bounding box from occupied cells (with some padding around them)
   let minQ=Infinity, maxQ=-Infinity, minR=Infinity, maxR=-Infinity;
@@ -436,7 +516,7 @@ function drawHex(boardDict, topPairs, player) {
     if (r<minR) minR=r; if (r>maxR) maxR=r;
   }
   // Also include pair targets in bounding box
-  if (topPairs) for (const p of topPairs) {
+  for (const p of drawPairs) {
     for (const q of [p.q1,p.q2]) {
       if (q<minQ) minQ=q; if (q>maxQ) maxQ=q;
     }
@@ -457,13 +537,12 @@ function drawHex(boardDict, topPairs, player) {
     (x0-vpad)+' '+(y0-vpad)+' '+(x1-x0+vpad*2)+' '+(y1-y0+vpad*2));
 
   // Collect pair target cells for highlighting
-  const pairCells = new Map(); // "q,r" -> total visits
-  if (topPairs) for (const p of topPairs) {
-    for (const [q,r] of [[p.q1,p.r1],[p.q2,p.r2]]) {
-      const k = q+','+r;
-      pairCells.set(k, (pairCells.get(k)||0) + p.v);
-    }
-  }
+  const pairCells = computeCellMarginals(topPairs || []);
+
+  // Heatmap: marginals from ALL pairs
+  const heatCells = showHeatmap ? computeCellMarginals(drawPairs) : null;
+  let heatMax = 0;
+  if (heatCells) for (const v of heatCells.values()) if (v > heatMax) heatMax = v;
 
   const isA = player === 1;
   const candFill   = isA ? 'rgba(88,166,255,.13)' : 'rgba(240,136,62,.13)';
@@ -477,26 +556,46 @@ function drawHex(boardDict, topPairs, player) {
       const k = q + ',' + r;
       const pl = boardDict[k] || 0;
       const isPairTarget = pairCells.has(k);
+      const heatVal = heatCells ? (heatCells.get(k) || 0) : 0;
       let fill, stroke, sw;
       if (pl === 1) {
         fill = '#58a6ff'; stroke = '#3a6fbf'; sw = '1.2';
       } else if (pl === 2) {
         fill = '#f0883e'; stroke = '#c55522'; sw = '1.2';
+      } else if (showHeatmap && heatVal > 0) {
+        // Heatmap: log scale for better visibility of low-visit cells
+        const intensity = Math.log(1 + heatVal) / Math.log(1 + heatMax);
+        const alpha = .08 + .7 * intensity;
+        fill = isA
+          ? 'rgba(88,166,255,' + alpha.toFixed(2) + ')'
+          : 'rgba(240,136,62,' + alpha.toFixed(2) + ')';
+        stroke = isA ? 'rgba(88,166,255,.6)' : 'rgba(240,136,62,.6)';
+        sw = '.6';
       } else if (isPairTarget) {
         fill = candFill; stroke = candStroke; sw = '1';
       } else {
         fill = '#0f1318'; stroke = '#1a2030'; sw = '.3';
       }
+      let title = '(' + q + ',' + r + ')';
+      if (pl) title += ' Player ' + (pl===1?'A':'B');
+      if (heatVal > 0) title += ' marginal=' + heatVal;
+      else if (isPairTarget) title += ' visits=' + pairCells.get(k);
       html += '<polygon points="' + hpts(px,py,szH) + '" fill="' + fill +
         '" stroke="' + stroke + '" stroke-width="' + sw +
-        '"><title>(' + q + ',' + r + ')' +
-        (pl ? ' Player ' + (pl===1?'A':'B') : '') +
-        (isPairTarget ? ' visits=' + pairCells.get(k) : '') +
-        '</title></polygon>';
+        '"><title>' + title + '</title></polygon>';
+
+      // Visit count label in heatmap mode
+      if (showHeatmap && heatVal > 0 && !pl) {
+        const intensity = Math.log(1 + heatVal) / Math.log(1 + heatMax);
+        const textAlpha = .3 + .7 * intensity;
+        html += '<text x="'+px.toFixed(1)+'" y="'+(py+3.5).toFixed(1)+
+          '" text-anchor="middle" font-size="6" font-weight="600" fill="rgba(255,255,255,'+
+          textAlpha.toFixed(2)+')" pointer-events="none">'+heatVal+'</text>';
+      }
     }
   }
 
-  // Draw pair connections as lines
+  // Draw pair connections as lines (only top pairs, not all)
   if (topPairs && topPairs.length) {
     const maxV = topPairs[0].v;
     for (const p of topPairs) {
@@ -511,17 +610,19 @@ function drawHex(boardDict, topPairs, player) {
         '" stroke-linecap="round"><title>(' +
         p.q1+','+p.r1+')-('+p.q2+','+p.r2+') v='+p.v+'</title></line>';
     }
-    // Dots on pair cells
-    for (const p of topPairs) {
-      for (const [q,r] of [[p.q1,p.r1],[p.q2,p.r2]]) {
-        if (boardDict[q+','+r]) continue; // don't draw over placed stones
-        const [px,py] = h2p(q,r,sz);
-        const rad = 1.5 + 2.5 * (p.v / maxV);
-        const dotFill = isA ? 'rgba(88,166,255,.55)' : 'rgba(240,136,62,.55)';
-        const dotStroke = isA ? '#58a6ff' : '#f0883e';
-        html += '<circle cx="'+px.toFixed(1)+'" cy="'+py.toFixed(1)+
-          '" r="'+rad.toFixed(1)+'" fill="'+dotFill+
-          '" stroke="'+dotStroke+'" stroke-width=".5"/>';
+    // Dots on pair cells (skip in heatmap mode — the fill already shows it)
+    if (!showHeatmap) {
+      for (const p of topPairs) {
+        for (const [q,r] of [[p.q1,p.r1],[p.q2,p.r2]]) {
+          if (boardDict[q+','+r]) continue;
+          const [px,py] = h2p(q,r,sz);
+          const rad = 1.5 + 2.5 * (p.v / maxV);
+          const dotFill = isA ? 'rgba(88,166,255,.55)' : 'rgba(240,136,62,.55)';
+          const dotStroke = isA ? '#58a6ff' : '#f0883e';
+          html += '<circle cx="'+px.toFixed(1)+'" cy="'+py.toFixed(1)+
+            '" r="'+rad.toFixed(1)+'" fill="'+dotFill+
+            '" stroke="'+dotStroke+'" stroke-width=".5"/>';
+        }
       }
     }
   }
@@ -541,6 +642,7 @@ function renderBoard() {
     svg.style.display='none'; ph.style.display=''; tl.style.display='none';
     info.innerHTML = ''; mvEl.innerHTML = '';
     document.getElementById('title').textContent = 'Select a game';
+    renderVisitPanel(null);
     return;
   }
 
@@ -552,7 +654,7 @@ function renderBoard() {
   slider.value = curTurn;
 
   const t = turns[curTurn];
-  drawHex(t.board, t.top_pairs, t.player);
+  drawHex(t.board, t.top_pairs, t.player, t.all_pairs);
 
   // title
   const val = gameDetail.value;
@@ -592,6 +694,94 @@ function renderBoard() {
   } else {
     mvEl.innerHTML = '';
   }
+
+  renderVisitPanel(t);
+}
+
+/* ---- visit detail panel ---- */
+function renderVisitPanel(turn) {
+  const vp = document.getElementById('vp');
+  const stats = document.getElementById('vstats');
+  const vlist = document.getElementById('vlist');
+
+  if (!turn || !vp.classList.contains('open')) {
+    stats.innerHTML = '';
+    vlist.innerHTML = '';
+    return;
+  }
+
+  const allPairs = turn.all_pairs || turn.top_pairs || [];
+  const totalVisits = allPairs.reduce((s,p) => s + p.v, 0);
+
+  // Concentration: what % does top-1, top-5 hold?
+  const top1pct = allPairs.length > 0 ? (100 * allPairs[0].v / totalVisits) : 0;
+  const top5sum = allPairs.slice(0,5).reduce((s,p) => s + p.v, 0);
+  const top5pct = totalVisits > 0 ? (100 * top5sum / totalVisits) : 0;
+
+  // Entropy
+  let entropy = 0;
+  if (totalVisits > 0) {
+    for (const p of allPairs) {
+      const prob = p.v / totalVisits;
+      if (prob > 0) entropy -= prob * Math.log2(prob);
+    }
+  }
+
+  stats.innerHTML =
+    '<span>Total visits: <b>' + totalVisits + '</b></span>' +
+    '<span>Unique pairs: <b>' + allPairs.length + '</b></span>' +
+    '<span>Top-1: <b>' + top1pct.toFixed(1) + '%</b>  Top-5: <b>' + top5pct.toFixed(1) + '%</b></span>' +
+    '<span>Entropy: <b>' + entropy.toFixed(2) + '</b> bits</span>';
+
+  if (visitMode === 'pairs') {
+    renderPairList(allPairs, totalVisits);
+  } else {
+    renderCellList(allPairs, totalVisits, turn.player);
+  }
+}
+
+function renderPairList(allPairs, totalVisits) {
+  const vlist = document.getElementById('vlist');
+  const maxV = allPairs.length > 0 ? allPairs[0].v : 1;
+  const isA = gameDetail && !gameDetail.drawn && gameDetail.value > 0;
+  const barCol = isA !== false ? '#58a6ff' : '#f0883e';
+
+  vlist.innerHTML = allPairs.map((p, i) => {
+    const pct = totalVisits > 0 ? (100 * p.v / totalVisits) : 0;
+    const barW = (100 * p.v / maxV);
+    return '<div class="vrow">' +
+      '<span class="vr">' + (i+1) + '</span>' +
+      '<span class="vc">(' + p.q1 + ',' + p.r1 + ')-(' + p.q2 + ',' + p.r2 + ')</span>' +
+      '<span class="vn">' + p.v + '</span>' +
+      '<span class="vpct">' + pct.toFixed(1) + '%</span>' +
+      '</div>' +
+      '<div style="padding:0 12px 2px 40px"><div class="vbar" style="width:' +
+      barW.toFixed(1) + '%;background:' + barCol + '"></div></div>';
+  }).join('');
+}
+
+function renderCellList(allPairs, totalVisits, player) {
+  const vlist = document.getElementById('vlist');
+  const cells = computeCellMarginals(allPairs);
+
+  // Sort by visits descending
+  const sorted = [...cells.entries()].sort((a,b) => b[1] - a[1]);
+  const maxV = sorted.length > 0 ? sorted[0][1] : 1;
+  const isA = player === 1;
+  const barCol = isA ? '#58a6ff' : '#f0883e';
+
+  vlist.innerHTML = sorted.map(([k, v], i) => {
+    const pct = totalVisits > 0 ? (100 * v / totalVisits) : 0;
+    const barW = (100 * v / maxV);
+    return '<div class="vrow">' +
+      '<span class="vr">' + (i+1) + '</span>' +
+      '<span class="vc">(' + k + ')</span>' +
+      '<span class="vn">' + v + '</span>' +
+      '<span class="vpct">' + pct.toFixed(1) + '%</span>' +
+      '</div>' +
+      '<div style="padding:0 12px 2px 40px"><div class="vbar" style="width:' +
+      barW.toFixed(1) + '%;background:' + barCol + '"></div></div>';
+  }).join('');
 }
 
 /* ---- timeline controls ---- */
@@ -614,6 +804,26 @@ document.addEventListener('keydown', e => {
     case 'Home':       e.preventDefault(); goTurn(0); break;
     case 'End':        e.preventDefault(); if(gameDetail) goTurn(gameDetail.turns.length-1); break;
   }
+});
+
+/* ---- visit panel controls ---- */
+document.getElementById('vpbtn').onclick = () => {
+  const vp = document.getElementById('vp');
+  vp.classList.toggle('open');
+  renderBoard();
+};
+
+document.getElementById('heatmapCb').onchange = e => {
+  showHeatmap = e.target.checked;
+  renderBoard();
+};
+
+document.querySelectorAll('.vtab').forEach(tab => {
+  tab.onclick = () => {
+    visitMode = tab.dataset.mode;
+    document.querySelectorAll('.vtab').forEach(t => t.classList.toggle('sel', t === tab));
+    renderBoard();
+  };
 });
 
 /* ---- init ---- */

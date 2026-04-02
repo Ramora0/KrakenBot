@@ -296,6 +296,22 @@ class SelfPlayManager:
                     moves = [s1, s2]
                     pair_visits = get_pair_visits(slot.tree)
 
+                # Debug: detect missing visits
+                total_pv = sum(pair_visits.values())
+                if total_pv < n_sims * 0.5:
+                    root = slot.tree.root_pos.move_node
+                    l1_total = sum(root.visits) if root.visits else 0
+                    l2_exists = root.level2 is not None
+                    l2_count = len(root.level2) if l2_exists else 0
+                    has_terminal = root._has_terminal
+                    n_terminal = sum(root.terminals) if root.terminals else 0
+                    print(f"  [WARN] game={slot.game_id} turn={turn_number} "
+                          f"pair_visits={total_pv}/{n_sims} "
+                          f"l1_visits={l1_total} l2_nodes={l2_count} "
+                          f"terminals={n_terminal} has_terminal={has_terminal} "
+                          f"moves_left={slot.game.moves_left_in_turn} "
+                          f"move_count={slot.game.move_count}")
+
                 # Record training example
                 if hasattr(slot.game, 'to_board_dict'):
                     board_dict = slot.game.to_board_dict()
