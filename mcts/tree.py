@@ -187,6 +187,8 @@ class MCTSTree:
     next_dist_frac: float = 0.0              # interpolation fraction for next ring
     board_width: int = BOARD_SIZE            # width of the board (for dynamic sizing)
     n_cells: int = N_CELLS                   # board_width ** 2
+    _root_occ_idx: frozenset | None = None   # cached occupied indices (int)
+    _root_nearby: set | None = None          # cached nearby candidates at root
 
 
 # ---------------------------------------------------------------------------
@@ -442,11 +444,16 @@ def _build_tree_from_eval(
 
     occupied_frozen = frozenset(occupied)
 
+    cached_occ_idx = None
+    cached_nearby = None
     if has_stones:
         if max_cand_dist is not None:
             occ_idx = frozenset(_cell_to_idx(q, r) for q, r in occupied)
-            cand_indices = list(_nearby_candidates(
-                occ_idx, max_cand_dist, next_dist_frac))
+            nearby = _nearby_candidates(
+                occ_idx, max_cand_dist, next_dist_frac)
+            cand_indices = list(nearby)
+            cached_occ_idx = occ_idx
+            cached_nearby = nearby
         else:
             occ_set = set(occupied)
             cand_indices = [_cell_to_idx(q, r)
@@ -475,6 +482,8 @@ def _build_tree_from_eval(
         noise_dist_scale=noise_dist_scale,
         max_cand_dist=max_cand_dist,
         next_dist_frac=next_dist_frac,
+        _root_occ_idx=cached_occ_idx,
+        _root_nearby=cached_nearby,
     )
 
 
@@ -640,7 +649,7 @@ def compute_max_cand_dist(round_num: int) -> tuple[int | None, float]:
     d = DIST_GATE_BASE + round_num // DIST_GATE_RAMP_ROUNDS
     frac = (round_num % DIST_GATE_RAMP_ROUNDS) / DIST_GATE_RAMP_ROUNDS
     # Cap at DIST_GATE_BASE (no ramp beyond it)
-    if d > DIST_GATE_BASE:
+    if d >= DIST_GATE_BASE:
         d = DIST_GATE_BASE
         frac = 0.0
     if d >= BOARD_SIZE // 2:
@@ -669,7 +678,14 @@ def _expand_level2(
     # All empty cells except stone_1, filtered by distance
     _bw = tree.board_width
     _nc = tree.n_cells
-    if tree.max_cand_dist is not None:
+    if tree.max_cand_dist is not None and tree._root_nearby is not None:
+        # Extend cached root nearby set with stone1's own neighbors
+        table = _NEIGHBORS_WITHIN[tree.max_cand_dist]
+        cand_set = tree._root_nearby | table[stone1_idx]
+        cand_set -= tree._root_occ_idx
+        cand_set.discard(stone1_idx)
+        cand_indices = list(cand_set)
+    elif tree.max_cand_dist is not None:
         occ_idx = set(
             _cell_to_idx(q, r, _bw) for q, r in tree.root_occupied
         ) | {stone1_idx}
