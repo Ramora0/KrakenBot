@@ -137,12 +137,13 @@ class SelfPlayManager:
         os.replace(tmp, path)
         print(f"Saved {len(pending)} in-progress games to {path}")
 
-    def generate(self, round_id: int) -> list[dict]:
+    def generate(self, round_id: int, force_warm: bool = False) -> list[dict]:
         """Generate completed games. Returns example dicts.
 
         On cold start (no pending games), targets COLD_START_GAMES to build
         a representative distribution of decisive and drawn games. On warm
         start, targets COMPLETED_PER_ROUND. Saves pending games at the end.
+        If force_warm is True, skip cold start (e.g. resuming a trained model).
         """
         model = self.model
         device = self.device
@@ -162,6 +163,8 @@ class SelfPlayManager:
         n_quick_turns = 0
 
         slots, next_game_id, is_cold_start = self._load_or_create_slots()
+        if force_warm:
+            is_cold_start = False
         target = COLD_START_GAMES if is_cold_start else COMPLETED_PER_ROUND
         if is_cold_start:
             print(f"Cold start: targeting {target} games to build distribution")

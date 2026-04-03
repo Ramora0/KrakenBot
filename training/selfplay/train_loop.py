@@ -1543,6 +1543,7 @@ def main():
             if use_parallel:
                 target = COLD_START_GAMES if (
                     is_cold_start and round_num == start_round
+                    and start_round == 0
                 ) else COMPLETED_PER_ROUND
                 examples, draw_rate, a_win_rate, avg_moves, far_pct, \
                     full_search_pct = pool.generate_round(
@@ -1571,7 +1572,8 @@ def main():
                     draw_penalty=args.draw_penalty,
                 )
                 examples, draw_rate, a_win_rate, avg_moves, far_pct, \
-                    full_search_pct = manager.generate(round_num)
+                    full_search_pct = manager.generate(
+                        round_num, force_warm=start_round > 0)
                 manager.save_round(examples, round_num, args.data_dir)
 
             model.float()
