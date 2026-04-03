@@ -1213,38 +1213,72 @@ class ParallelSelfPlayPool:
         # Games 0..half-1: current=A; half..n_games-1: current=B
         # game_ids match global_idx at start (slot.game_id = next_game_id + gi)
 
+        # Must use pool's n_sims to stay in sync with workers
+        n_sims = self.n_sims
+        model_list = [current_model, anchor_model]
+
+        t_wait = 0.0
+        t_gpu = 0.0
+        t_tree_gpu = 0.0
+        t_collect = 0.0
+        n_turns = 0
+
         try:
             while games_completed < total_target:
                 # === Tree creation phase ===
+                _t0 = time.monotonic()
                 sync['tree_request_ready'].wait()
                 sync['tree_request_ready'].clear()
+                t_wait += time.monotonic() - _t0
 
                 if sync['error'].value:
                     _drain_errors(result_queue)
                     raise RuntimeError("Worker process failed")
 
-                _gpu_tree_forward([current_model, anchor_model], device,
-                                  shared)
+                _t0 = time.monotonic()
+                _gpu_tree_forward(model_list, device, shared)
+                t_tree_gpu += time.monotonic() - _t0
+
                 sync['tree_results_ready'].set()
 
                 # === Sim loop ===
                 for sim in range(n_sims):
                     buf_idx = sim % 2
+
+                    _t0 = time.monotonic()
                     sync['deltas_ready'][buf_idx].wait()
                     sync['deltas_ready'][buf_idx].clear()
+                    t_wait += time.monotonic() - _t0
 
                     if sync['error'].value:
                         _drain_errors(result_queue)
                         raise RuntimeError("Worker process failed")
 
-                    _gpu_forward([current_model, anchor_model], device,
+                    _t0 = time.monotonic()
+                    _gpu_forward(model_list, device,
                                  shared.delta[buf_idx],
                                  shared.needs_eval[buf_idx],
                                  shared.needs_expand_flag[buf_idx],
                                  shared)
+                    t_gpu += time.monotonic() - _t0
+
                     sync['results_ready'].set()
 
+                n_turns += 1
+                if n_turns % 10 == 0:
+                    t_tot = t_wait + t_gpu + t_tree_gpu + t_collect
+                    if t_tot > 0:
+                        pbar.write(
+                            f"  [eval turn {n_turns}] "
+                            f"wait_cpu {t_wait/t_tot*100:.0f}% "
+                            f"gpu {t_gpu/t_tot*100:.0f}% "
+                            f"tree_gpu {t_tree_gpu/t_tot*100:.0f}% "
+                            f"collect {t_collect/t_tot*100:.0f}% "
+                            f"| {n_turns/t_tot:.1f} turns/s"
+                        )
+
                 # === Collect results ===
+                _t0 = time.monotonic()
                 for _ in range(self.n_workers):
                     while True:
                         try:
@@ -1283,6 +1317,8 @@ class ParallelSelfPlayPool:
                         games_completed += 1
                         pbar.update(1)
 
+                t_collect += time.monotonic() - _t0
+
                 if games_completed >= total_target:
                     break
 
@@ -1317,6 +1353,18 @@ class ParallelSelfPlayPool:
             self._eval_mode.value = 0
             # Reset model_for_player to all-zero (single model)
             shared.model_for_player.fill_(0)
+
+        # Print timing summary
+        t_tot = t_wait + t_gpu + t_tree_gpu + t_collect
+        if t_tot > 0 and n_turns > 0:
+            print(f"\n  Eval timing ({n_turns} turns, {t_tot:.1f}s):")
+            for label, t in [("wait_cpu", t_wait), ("gpu_fwd", t_gpu),
+                             ("tree_gpu", t_tree_gpu),
+                             ("collect", t_collect)]:
+                print(f"    {label:>10s}: {t:6.1f}s ({100*t/t_tot:4.1f}%) "
+                      f" {1000*t/n_turns:6.1f}ms/turn")
+            print(f"    {'total':>10s}: {t_tot:6.1f}s  "
+                  f"{n_turns/t_tot:.1f} turns/s")
 
         total = max(wins + losses + draws, 1)
         score = (wins + 0.5 * draws) / total
