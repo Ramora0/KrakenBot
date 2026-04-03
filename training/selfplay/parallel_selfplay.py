@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import random
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -863,9 +864,12 @@ class ParallelSelfPlayPool:
     """
 
     def __init__(self, batch_size, n_sims, n_workers=8,
-                 model_dtype=torch.float32):
+                 model_dtype=torch.float32,
+                 n_sims_full=600, full_search_prob=0.25):
         self.batch_size = batch_size
         self.n_sims = n_sims
+        self.n_sims_full = n_sims_full
+        self.full_search_prob = full_search_prob
         self.n_workers = n_workers
 
         # Shared memory (allocated once, reused across rounds)
@@ -887,6 +891,9 @@ class ParallelSelfPlayPool:
         # Eval mode flags (shared with workers)
         self._eval_mode = mp.Value('i', 0)    # 1 = eval mode (no replace, no noise)
         self._eval_temperature = mp.Value('f', 0.1)
+        # Playout cap randomization (main writes, workers read per turn)
+        self._turn_n_sims = mp.Value('i', n_sims)
+        self._is_full_search = mp.Value('i', 0)
 
     def start(self, game_dicts, next_game_id):
         """Spawn workers with initial game data. Call once."""
@@ -911,6 +918,7 @@ class ParallelSelfPlayPool:
                       self._new_round, self._round_end_barrier,
                       self._next_game_id,
                       self._eval_mode, self._eval_temperature,
+                      self._turn_n_sims, self._is_full_search,
                       self.result_queue),
             )
             p.start()
@@ -953,6 +961,8 @@ class ParallelSelfPlayPool:
         total_moves = 0
         far_stones = 0
         total_stones = 0
+        n_full_turns = 0
+        n_quick_turns = 0
 
         pbar = tqdm(total=target, desc="Games", unit="game", position=0)
         pos_bar = tqdm(desc="Positions", unit="pos", position=1)
@@ -980,10 +990,20 @@ class ParallelSelfPlayPool:
                 _gpu_tree_forward(model, device, shared)
                 t_tree_gpu += time.monotonic() - _t0
 
+                # Playout cap: decide sim count for this turn before workers proceed
+                is_full = random.random() < self.full_search_prob
+                turn_sims = self.n_sims_full if is_full else n_sims
+                self._turn_n_sims.value = turn_sims
+                self._is_full_search.value = int(is_full)
+                if is_full:
+                    n_full_turns += 1
+                else:
+                    n_quick_turns += 1
+
                 sync['tree_results_ready'].set()
 
                 # === Sim loop ===
-                for sim in range(n_sims):
+                for sim in range(turn_sims):
                     buf_idx = sim % 2
 
                     _t0 = time.monotonic()
@@ -1149,7 +1169,11 @@ class ParallelSelfPlayPool:
         a_win_rate = wins_a / max(decisive, 1)
         avg_moves = total_moves / max(total_games, 1)
         far_pct = 100 * far_stones / max(total_stones, 1)
-        return all_examples, draw_rate, a_win_rate, avg_moves, far_pct
+        full_search_pct = n_full_turns / max(n_full_turns + n_quick_turns, 1)
+        print(f"  Full-search turns: {n_full_turns}/{n_full_turns + n_quick_turns} "
+              f"({100 * full_search_pct:.1f}%)")
+        return all_examples, draw_rate, a_win_rate, avg_moves, far_pct, \
+            full_search_pct
 
     def evaluate(self, models, device, n_games=256, n_sims=200,
                  temperature=0.1):
@@ -1238,6 +1262,10 @@ class ParallelSelfPlayPool:
                 _t0 = time.monotonic()
                 _gpu_tree_forward(model_list, device, shared)
                 t_tree_gpu += time.monotonic() - _t0
+
+                # Eval: always use fixed sim count, no playout cap
+                self._turn_n_sims.value = n_sims
+                self._is_full_search.value = 0
 
                 sync['tree_results_ready'].set()
 
@@ -1408,6 +1436,7 @@ def _pool_worker_fn(worker_id, n_workers, batch_size, n_sims,
                     new_round_event, round_end_barrier,
                     next_game_id_shared,
                     eval_mode_val, eval_temp_val,
+                    turn_n_sims_val, is_full_search_val,
                     result_queue):
     """Persistent worker: stays alive across rounds."""
     try:
@@ -1420,6 +1449,7 @@ def _pool_worker_fn(worker_id, n_workers, batch_size, n_sims,
             new_round_event, round_end_barrier,
             next_game_id_shared,
             eval_mode_val, eval_temp_val,
+            turn_n_sims_val, is_full_search_val,
             result_queue)
     except Exception:
         sync['error'].value = 1
@@ -1442,6 +1472,7 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                       new_round_event, round_end_barrier,
                       next_game_id_shared,
                       eval_mode_val, eval_temp_val,
+                      turn_n_sims_val, is_full_search_val,
                       result_queue):
     """Inner loop for persistent pool worker."""
     games_per_worker = batch_size // n_workers
@@ -1539,6 +1570,10 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
             if stop_flag.value or round_stop.value:
                 break
 
+            # Read per-turn sim count set by main before tree_results_ready
+            turn_n_sims = turn_n_sims_val.value
+            is_full = bool(is_full_search_val.value)
+
             for i, slot in enumerate(slots):
                 gi = my_start + i
                 if shared_bufs.tree_needs_init[gi]:
@@ -1574,12 +1609,12 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                 if worker_id == 0:
                     deltas_ready[0].set()
 
-                for sim in range(n_sims):
+                for sim in range(turn_n_sims):
                     buf_cur = sim % 2
                     buf_next = (sim + 1) % 2
 
                     next_leaves = [None] * n_mine
-                    if sim < n_sims - 1:
+                    if sim < turn_n_sims - 1:
                         for i, slot in enumerate(slots):
                             gi = my_start + i
                             if slot.tree is None:
@@ -1613,7 +1648,7 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                     wb.wait()
                     if worker_id == 0:
                         results_ready.clear()
-                        if sim < n_sims - 1:
+                        if sim < turn_n_sims - 1:
                             deltas_ready[buf_next].set()
             except BrokenBarrierError:
                 break
@@ -1662,6 +1697,7 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                         "move_count": slot.game.move_count,
                         "moves_left": 0,
                         "game_drawn": False,
+                        "full_search": is_full,
                         "game_id": slot.game_id,
                         "round_id": round_id,
                     }

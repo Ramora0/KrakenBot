@@ -77,7 +77,7 @@ def _precompute_chain_tables(N=BOARD_SIZE, win_len=6):
 _WIN_QS, _WIN_RS, _CW_PER_DIR, _CM_PER_DIR = _precompute_chain_tables()
 
 
-CHAIN_VERSION = 3  # bump when cached fields change (added current_players)
+CHAIN_VERSION = 4  # bump when cached fields change (added full_search)
 
 
 def compute_chain_targets(board_dict, current_player):
@@ -150,6 +150,7 @@ class SelfPlayDataset(torch.utils.data.Dataset):
     def __init__(self, planes, visit_dicts, values, round_ids,
                  current_players,
                  chain_targets, chain_masks, moves_left, draw_mask,
+                 full_search,
                  current_round, decay=0.75, augment=True):
         self.planes = planes              # [N, 2, 25, 25]
         self.visit_dicts = visit_dicts    # list of list[(flat_pair_idx, prob)]
@@ -158,6 +159,7 @@ class SelfPlayDataset(torch.utils.data.Dataset):
         self.chain_masks = chain_masks    # [N, 6, 25, 25]
         self.moves_left = moves_left      # [N]
         self.draw_mask = draw_mask        # [N] bool — True = drawn, mask out
+        self.full_search = full_search    # [N] bool — True = full-search turn
         self.augment = augment
         self._NN = BOARD_SIZE * BOARD_SIZE
 
@@ -201,6 +203,7 @@ class SelfPlayDataset(torch.utils.data.Dataset):
         chain_m = self.chain_masks[idx]     # [6, 25, 25]
         ml = self.moves_left[idx]
         drawn = self.draw_mask[idx]
+        fs = self.full_search[idx]
 
         if self.augment:
             k = random.randint(0, 11)
@@ -228,7 +231,7 @@ class SelfPlayDataset(torch.utils.data.Dataset):
                 for flat_idx, prob in visit_entries:
                     visit_vec[flat_idx] = prob
 
-        return planes, visit_vec, value, chain_t, chain_m, ml, drawn
+        return planes, visit_vec, value, chain_t, chain_m, ml, drawn, fs
 
 
 def _load_sft_examples(parquet_path: str, max_examples: int = 50000):
@@ -359,7 +362,9 @@ def _preprocess_round(parquet_path: str) -> dict:
     chain_m = torch.zeros(n, 6, bs, bs)
     ml = torch.zeros(n)
     dm = torch.zeros(n, dtype=torch.bool)
+    fs = torch.ones(n, dtype=torch.bool)  # default True for old data
     has_ml = "moves_left" in df.columns
+    has_fs = "full_search" in df.columns
 
     for i, row in enumerate(tqdm(df.itertuples(), total=n,
                                   desc=f"  Caching {os.path.basename(parquet_path)}",
@@ -392,6 +397,8 @@ def _preprocess_round(parquet_path: str) -> dict:
             dm[i] = bool(row.game_drawn)
         else:
             dm[i] = True
+        if has_fs:
+            fs[i] = bool(row.full_search)
 
     result = {
         'planes': planes, 'visit_dicts': visit_dicts,
@@ -399,6 +406,7 @@ def _preprocess_round(parquet_path: str) -> dict:
         'current_players': cps,
         'chain_targets': chain_t, 'chain_masks': chain_m,
         'moves_left': ml, 'draw_mask': dm,
+        'full_search': fs,
         'chain_version': CHAIN_VERSION,
     }
     torch.save(result, cache_path)
@@ -418,7 +426,8 @@ def load_selfplay_rounds(data_dir: str, current_round: int,
     rounds = range(max(0, current_round - window + 1), current_round + 1)
 
     all_planes, all_visits, all_values = [], [], []
-    all_rids, all_cps, all_ct, all_cm, all_ml, all_dm = [], [], [], [], [], []
+    all_rids, all_cps, all_ct, all_cm, all_ml, all_dm, all_fs = \
+        [], [], [], [], [], [], []
 
     for r in rounds:
         path = os.path.join(data_dir, f"round_{r}.parquet")
@@ -435,6 +444,8 @@ def load_selfplay_rounds(data_dir: str, current_round: int,
         all_cm.append(d['chain_masks'])
         all_ml.append(d['moves_left'])
         all_dm.append(d['draw_mask'])
+        all_fs.append(d.get('full_search', torch.ones(len(d['values']),
+                                                       dtype=torch.bool)))
 
     if not all_planes:
         raise FileNotFoundError(f"No self-play data for rounds {list(rounds)}")
@@ -447,6 +458,7 @@ def load_selfplay_rounds(data_dir: str, current_round: int,
     chain_masks = torch.cat(all_cm)
     moves_left_tensor = torch.cat(all_ml)
     draw_mask = torch.cat(all_dm)
+    full_search = torch.cat(all_fs)
     visit_dicts = all_visits
     n = len(value_tensor)
 
@@ -476,11 +488,15 @@ def load_selfplay_rounds(data_dir: str, current_round: int,
             # SFT: mark as player 0 so outcome balancing skips them
             current_players = torch.cat([
                 current_players, torch.zeros(n_sft, dtype=torch.int8)])
+            # SFT always counts as full_search (has hard move targets)
+            full_search = torch.cat([
+                full_search, torch.ones(n_sft, dtype=torch.bool)])
 
     dataset = SelfPlayDataset(
         planes_tensor, visit_dicts, value_tensor, round_ids,
         current_players,
         chain_targets, chain_masks, moves_left_tensor, draw_mask,
+        full_search,
         current_round, decay=decay, augment=augment,
     )
 
@@ -495,6 +511,7 @@ def compute_selfplay_loss(value_pred, pair_logits, moves_left_pred, chain_pred,
                           visit_dist, value_target,
                           moves_left_target, draw_mask,
                           chain_target, chain_mask,
+                          full_search=None,
                           value_weight=1.0):
     """Combined loss: value + policy + moves_left + chain."""
     B, N_sq, _ = pair_logits.shape
@@ -509,7 +526,15 @@ def compute_selfplay_loss(value_pred, pair_logits, moves_left_pred, chain_pred,
     flat_logits = pair_logits.reshape(B, -1)
     log_probs = F.log_softmax(flat_logits, dim=-1)
     # nan_to_num: 0 * -inf (diagonal) -> nan -> 0
-    policy_loss = -(visit_dist * log_probs).nan_to_num(0.0).sum(dim=-1).mean()
+    per_sample_ploss = -(visit_dist * log_probs).nan_to_num(0.0).sum(dim=-1)
+    # Policy loss: only on full-search positions (playout cap randomization)
+    if full_search is not None and not full_search.all():
+        if full_search.any():
+            policy_loss = per_sample_ploss[full_search].mean()
+        else:
+            policy_loss = torch.zeros(1, device=value_pred.device).squeeze()
+    else:
+        policy_loss = per_sample_ploss.mean()
 
     # --- Auxiliary: moves left (mask drawn games, normalize to [0,1]) ---
     valid = ~draw_mask
@@ -553,7 +578,8 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
     n_batches = 0
 
     for (planes, visit_dist, value_target,
-         chain_target, chain_mask, ml_target, drawn) in tqdm(
+         chain_target, chain_mask, ml_target, drawn,
+         full_search) in tqdm(
             loader, desc="Training", unit="batch"):
         planes = planes.to(device)
         visit_dist = visit_dist.to(device)
@@ -562,6 +588,7 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
         chain_mask = chain_mask.to(device)
         ml_target = ml_target.to(device)
         drawn = drawn.to(device)
+        full_search = full_search.to(device)
 
         optimizer.zero_grad()
 
@@ -572,6 +599,7 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
                     value_pred, pair_logits, ml_pred, chain_pred,
                     visit_dist, value_target, ml_target, drawn,
                     chain_target, chain_mask,
+                    full_search=full_search,
                     value_weight=value_weight)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -584,6 +612,7 @@ def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
                 value_pred, pair_logits, ml_pred, chain_pred,
                 visit_dist, value_target, ml_target, drawn,
                 chain_target, chain_mask,
+                full_search=full_search,
                 value_weight=value_weight)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -1232,8 +1261,12 @@ def main():
                         help="Number of training rounds (default: run indefinitely)")
     parser.add_argument("--batch-size", type=int, default=256,
                         help="Number of parallel games in self-play")
-    parser.add_argument("--n-sims", type=int, default=200,
-                        help="MCTS simulations per turn")
+    parser.add_argument("--n-sims", type=int, default=100,
+                        help="MCTS simulations per turn (quick search)")
+    parser.add_argument("--n-sims-full", type=int, default=600,
+                        help="MCTS sims for full-search turns (playout cap)")
+    parser.add_argument("--full-search-prob", type=float, default=0.25,
+                        help="Probability of full-search turn (0=disabled)")
     parser.add_argument("--train-batch-size", type=int, default=256,
                         help="Training batch size")
     parser.add_argument("--lr", type=float, default=0.005,
@@ -1446,7 +1479,9 @@ def main():
 
         model_dtype = torch.bfloat16  # inference runs in bfloat16
         pool = ParallelSelfPlayPool(
-            args.batch_size, args.n_sims, args.n_workers, model_dtype)
+            args.batch_size, args.n_sims, args.n_workers, model_dtype,
+            n_sims_full=args.n_sims_full,
+            full_search_prob=args.full_search_prob)
         pool.start(game_dicts, next_game_id)
 
     try:
@@ -1467,8 +1502,8 @@ def main():
                 target = COLD_START_GAMES if (
                     is_cold_start and round_num == start_round
                 ) else COMPLETED_PER_ROUND
-                examples, draw_rate, a_win_rate, avg_moves, far_pct = \
-                    pool.generate_round(
+                examples, draw_rate, a_win_rate, avg_moves, far_pct, \
+                    full_search_pct = pool.generate_round(
                         model, device,
                         round_id=round_num,
                         data_dir=args.data_dir,
@@ -1486,13 +1521,15 @@ def main():
                     model, device,
                     batch_size=args.batch_size,
                     n_sims=args.n_sims,
+                    n_sims_full=args.n_sims_full,
+                    full_search_prob=args.full_search_prob,
                     data_dir=args.data_dir,
                     viewer=viewer,
                     late_temperature=args.late_temperature,
                     draw_penalty=args.draw_penalty,
                 )
-                examples, draw_rate, a_win_rate, avg_moves, far_pct = \
-                    manager.generate(round_num)
+                examples, draw_rate, a_win_rate, avg_moves, far_pct, \
+                    full_search_pct = manager.generate(round_num)
                 manager.save_round(examples, round_num, args.data_dir)
 
             model.float()
@@ -1593,6 +1630,7 @@ def main():
             print(f"    Examples: {len(examples):,}")
             print(f"    Draw rate: {100 * draw_rate:.1f}%")
             print(f"    Far moves (>dist 2): {far_pct:.1f}%")
+            print(f"    Full-search turns: {100 * full_search_pct:.1f}%")
             print(f"    Loss: {avg_loss:.4f}")
             if eval_result is not None:
                 print(f"    Elo: {cumulative_elo:.0f} "
@@ -1615,6 +1653,7 @@ def main():
                     "a_win_pct": a_win_rate,
                     "avg_moves": avg_moves,
                     "far_move_pct": far_pct,
+                    "full_search_pct": full_search_pct,
                     "examples": len(examples),
                     "time_gen": t_gen,
                     "time_train": t_train,

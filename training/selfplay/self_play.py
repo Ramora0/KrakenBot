@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import time
 from dataclasses import dataclass, field
 
@@ -59,12 +60,15 @@ class SelfPlaySlot:
 
 class SelfPlayManager:
     def __init__(self, model, device, batch_size=256, n_sims=200,
+                 n_sims_full=600, full_search_prob=0.25,
                  data_dir="training/data/selfplay", viewer=None,
                  late_temperature=0.3, draw_penalty=0.1):
         self.model = model
         self.device = device
         self.batch_size = batch_size
         self.n_sims = n_sims
+        self.n_sims_full = n_sims_full
+        self.full_search_prob = full_search_prob
         self.data_dir = data_dir
         self.viewer = viewer
         self.late_temperature = late_temperature
@@ -154,6 +158,8 @@ class SelfPlayManager:
         total_moves_in_completed = 0
         far_stones = 0      # stones placed > dist 2 from any existing stone
         total_stones = 0    # all stones placed (excl. first center stone)
+        n_full_turns = 0
+        n_quick_turns = 0
 
         slots, next_game_id, is_cold_start = self._load_or_create_slots()
         target = COLD_START_GAMES if is_cold_start else COMPLETED_PER_ROUND
@@ -196,11 +202,19 @@ class SelfPlayManager:
                 self._batch_create_trees(slots, needs_tree, model, device)
                 t_tree_create += time.monotonic() - _t0
 
-            # --- Phase 2: Run n_sims with double-buffered GPU overlap ---
+            # --- Phase 2: Run sims with double-buffered GPU overlap ---
+            # Playout cap randomization: all slots get same sim count per turn
+            is_full_search = (random.random() < self.full_search_prob)
+            turn_sims = self.n_sims_full if is_full_search else n_sims
+            if is_full_search:
+                n_full_turns += 1
+            else:
+                n_quick_turns += 1
+
             slots_A = slots[:half]
             slots_B = slots[half:]
 
-            for _sim in range(n_sims):
+            for _sim in range(turn_sims):
                 # -- Select + prepare group A (CPU) --
                 _t0 = time.monotonic()
                 leaves_A = [_sel(s.tree, s.game) for s in slots_A]
@@ -302,7 +316,7 @@ class SelfPlayManager:
 
                 # Debug: detect missing visits
                 total_pv = sum(pair_visits.values())
-                if total_pv < n_sims * 0.5:
+                if total_pv < turn_sims * 0.5:
                     root = slot.tree.root_pos.move_node
                     l1_total = sum(root.visits) if root.visits else 0
                     l2_exists = root.level2 is not None
@@ -336,6 +350,7 @@ class SelfPlayManager:
                     "move_count": slot.game.move_count,
                     "moves_left": 0,      # backfilled after game ends
                     "game_drawn": False,   # backfilled after game ends
+                    "full_search": is_full_search,
                     "game_id": slot.game_id,
                     "round_id": round_id,
                 }
@@ -459,9 +474,13 @@ class SelfPlayManager:
         a_win_rate = wins_a / max(decisive, 1)
         avg_moves = total_moves_in_completed / max(total_games, 1)
         far_pct = 100 * far_stones / max(total_stones, 1)
+        full_search_pct = n_full_turns / max(n_full_turns + n_quick_turns, 1)
         print(f"  Far moves (>dist 2): {far_stones}/{total_stones} "
               f"({far_pct:.1f}%)")
-        return all_examples, draw_rate, a_win_rate, avg_moves, far_pct
+        print(f"  Full-search turns: {n_full_turns}/{n_full_turns + n_quick_turns} "
+              f"({100 * full_search_pct:.1f}%)")
+        return all_examples, draw_rate, a_win_rate, avg_moves, far_pct, \
+            full_search_pct
 
     def _new_slot(self, game_id: int) -> SelfPlaySlot:
         """Create a new game slot on a toroidal board. First move at center."""
@@ -591,6 +610,7 @@ class SelfPlayManager:
         chain_m = torch.zeros(n, 6, BOARD_SIZE, BOARD_SIZE)
         ml = torch.zeros(n)
         dm = torch.zeros(n, dtype=torch.bool)
+        fs = torch.zeros(n, dtype=torch.bool)
 
         for i, ex in enumerate(examples):
             board_raw = json.loads(ex["board"])
@@ -627,6 +647,7 @@ class SelfPlayManager:
             rids[i] = ex["round_id"]
             ml[i] = ex.get("moves_left", 0)
             dm[i] = bool(ex.get("game_drawn", False))
+            fs[i] = bool(ex.get("full_search", True))
 
         from training.selfplay.train_loop import CHAIN_VERSION
         cache_path = path.replace('.parquet', '.pt')
@@ -635,6 +656,7 @@ class SelfPlayManager:
             'values': values, 'round_ids': rids,
             'chain_targets': chain_t, 'chain_masks': chain_m,
             'moves_left': ml, 'draw_mask': dm,
+            'full_search': fs,
             'chain_version': CHAIN_VERSION,
         }, cache_path)
 
