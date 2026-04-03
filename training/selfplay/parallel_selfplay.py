@@ -510,8 +510,9 @@ def _gpu_forward(models, device, delta_buf, needs_eval, needs_expand_flag,
             sub_idx = mask.nonzero(as_tuple=True)[0]
             sub_batch = delta_buf[indices[sub_idx]].to(device, non_blocking=True)
             v, pl, _, _ = m(sub_batch)
-            values[sub_idx] = v.squeeze(-1) if v.dim() > 1 else v
-            pair_logits[sub_idx] = pl
+            v_flat = v.squeeze(-1) if v.dim() > 1 else v
+            values[sub_idx] = v_flat.float()
+            pair_logits[sub_idx] = pl.float()
 
     # Write values (bulk copy, no Python loop)
     vals_cpu = values.cpu()
@@ -583,8 +584,9 @@ def _gpu_tree_forward(models, device, shared):
             sub_batch = shared.tree_planes[indices[sub_idx]].to(
                 device, non_blocking=True)
             v, pl, _, _ = m(sub_batch)
-            values[sub_idx] = v.squeeze(-1) if v.dim() > 1 else v
-            pair_logits[sub_idx] = pl
+            v_flat = v.squeeze(-1) if v.dim() > 1 else v
+            values[sub_idx] = v_flat.float()
+            pair_logits[sub_idx] = pl.float()
 
     # Compute pair_probs and marginals in bulk on GPU
     flat = pair_logits.reshape(B, -1)

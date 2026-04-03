@@ -280,6 +280,35 @@ def _nearby_candidates(
     return result
 
 
+def _nearby_candidates_dynamic(
+    occupied_indices: set[int] | frozenset[int],
+    board_width: int,
+    board_height: int,
+    max_dist: int = MAX_CAND_DIST,
+) -> set[int]:
+    """Like _nearby_candidates but for arbitrary (non-torus) board sizes.
+
+    Only used during inference / evaluation on infinite grids.
+    """
+    _t0 = time.monotonic()
+    if not occupied_indices:
+        return set()
+    result: set[int] = set()
+    w = board_width
+    for idx in occupied_indices:
+        sq, sr = idx // w, idx % w
+        for dq in range(-max_dist, max_dist + 1):
+            for dr in range(-max_dist, max_dist + 1):
+                if max(abs(dq), abs(dr), abs(dq + dr)) > max_dist:
+                    continue
+                nq, nr = sq + dq, sr + dr
+                if 0 <= nq < board_height and 0 <= nr < w:
+                    result.add(nq * w + nr)
+    result -= occupied_indices
+    cpu_profile.nearby_cands += time.monotonic() - _t0
+    return result
+
+
 # ---------------------------------------------------------------------------
 # PUCT (vectorized)
 # ---------------------------------------------------------------------------
@@ -588,6 +617,10 @@ def create_tree_dynamic(
     root_player = cp if hasattr(cp, 'value') else Player(cp)
     occupied_frozen = frozenset(occupied_grid)
 
+    # Cache occupied indices and nearby set for _expand_level2
+    occ_idx = frozenset(gq * bw + gr for gq, gr in occupied_grid)
+    nearby = _nearby_candidates_dynamic(occ_idx, bw, h) if occ_idx else set()
+
     tree = MCTSTree(
         root_pos=pos,
         pair_probs=pair_probs,
@@ -597,6 +630,8 @@ def create_tree_dynamic(
         root_occupied=occupied_frozen,
         board_width=bw,
         n_cells=nc,
+        _root_occ_idx=occ_idx if occ_idx else None,
+        _root_nearby=nearby if occ_idx else None,
     )
     return tree, off_q, off_r
 
@@ -623,8 +658,14 @@ def _expand_level2(
     # All empty cells except stone_1, filtered by distance
     if tree._root_nearby is not None:
         # Extend cached root nearby set with stone1's own neighbors
-        table = _NEIGHBORS_WITHIN[MAX_CAND_DIST]
-        cand_set = tree._root_nearby | table[stone1_idx]
+        _bw = tree.board_width
+        if _bw == BOARD_SIZE:
+            table = _NEIGHBORS_WITHIN[MAX_CAND_DIST]
+            stone1_neighbors = table[stone1_idx]
+        else:
+            stone1_neighbors = _nearby_candidates_dynamic(
+                {stone1_idx}, _bw, tree.n_cells // _bw)
+        cand_set = tree._root_nearby | stone1_neighbors
         cand_set -= tree._root_occ_idx
         cand_set.discard(stone1_idx)
         cand_indices = list(cand_set)
@@ -633,7 +674,11 @@ def _expand_level2(
         occ_idx = set(
             _cell_to_idx(q, r, _bw) for q, r in tree.root_occupied
         ) | {stone1_idx}
-        cand_indices = list(_nearby_candidates(occ_idx))
+        if _bw == BOARD_SIZE:
+            cand_indices = list(_nearby_candidates(occ_idx))
+        else:
+            _bh = tree.n_cells // _bw
+            cand_indices = list(_nearby_candidates_dynamic(occ_idx, _bw, _bh))
 
     cand_values = cond_probs[cand_indices].tolist()
     cand_priors = list(zip(cand_indices, cand_values))
