@@ -1550,11 +1550,22 @@ def main():
                       f"{args.eval_sims} sims ---")
                 t2 = time.time()
                 model.eval()
-                eval_result = evaluate_vs_anchor(
-                    model, anchor_model, device,
-                    n_games=args.eval_games,
-                    n_sims=args.eval_sims,
-                )
+                if use_parallel and pool is not None:
+                    model.bfloat16()
+                    anchor_model.bfloat16()
+                    eval_result = pool.evaluate(
+                        (model, anchor_model), device,
+                        n_games=args.eval_games,
+                        n_sims=args.eval_sims,
+                    )
+                    model.float()
+                    anchor_model.float()
+                else:
+                    eval_result = evaluate_vs_anchor(
+                        model, anchor_model, device,
+                        n_games=args.eval_games,
+                        n_sims=args.eval_sims,
+                    )
                 t_eval = time.time() - t2
 
                 score = eval_result["score"]

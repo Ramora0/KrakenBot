@@ -94,6 +94,16 @@ class SharedBuffers:
         self.tree_pair_probs = torch.zeros(
             batch_size, N_CELLS, N_CELLS, dtype=torch.float16).share_memory_()
 
+        # Per-slot model ID (workers write, main reads)
+        # 0 = primary model, 1 = opponent model. All-zero for self-play.
+        self.model_id = torch.zeros(
+            batch_size, dtype=torch.int8).share_memory_()
+        # Per-slot model assignment: model_for_player[gi, player_int]
+        # Maps (game, player) → model_id. Set by main at init.
+        # player_int: 1=Player.A, 2=Player.B
+        self.model_for_player = torch.zeros(
+            batch_size, 3, dtype=torch.int8).share_memory_()  # index 0 unused
+
         # Synchronization
         # worker_barrier: workers sync among themselves
         # deltas_ready[i]: signals main that delta buf[i] is filled
@@ -202,6 +212,7 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
         shared_bufs.tree_needs_init[my_start:my_end] = False
         for i, slot in enumerate(slots):
             gi = my_start + i
+            _write_model_id(shared_bufs, slot, gi)
             if slot.tree is None and not slot.game.game_over \
                and slot.game.move_count < MAX_GAME_MOVES:
                 if hasattr(slot.game, 'to_planes_tensor'):
@@ -416,6 +427,13 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                           turn_far_total, turn_stones_total))
 
 
+def _write_model_id(shared, slot, global_idx):
+    """Set model_id for this slot based on current_player and assignment."""
+    cp = slot.game.current_player
+    cp_int = cp.value if hasattr(cp, 'value') else int(cp)
+    shared.model_id[global_idx] = shared.model_for_player[global_idx, cp_int]
+
+
 def _write_delta(shared, leaf, tree, global_idx, buf_idx):
     """Write one leaf's delta planes to shared buffer."""
     rp = tree.root_planes
@@ -457,17 +475,43 @@ def _serialize_slot(slot):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def _gpu_forward(model, device, delta_buf, needs_eval, needs_expand_flag,
+def _gpu_forward(models, device, delta_buf, needs_eval, needs_expand_flag,
                  shared):
-    """Run GPU forward on the delta buffer, write results to shared."""
+    """Run GPU forward on the delta buffer, write results to shared.
+
+    Args:
+        models: single model or list/tuple of models.
+            When multiple models are given, shared.model_id routes each
+            slot to the correct model.
+    """
+    if not isinstance(models, (list, tuple)):
+        models = [models]
+
     indices = needs_eval.nonzero(as_tuple=True)[0]
     B = len(indices)
 
     if B == 0:
         return
 
-    batch = delta_buf[indices].to(device, non_blocking=True)
-    values, pair_logits, _, _ = model(batch)
+    if len(models) == 1:
+        # Fast path: single model (self-play)
+        batch = delta_buf[indices].to(device, non_blocking=True)
+        values, pair_logits, _, _ = models[0](batch)
+    else:
+        # Multi-model: split by model_id, run each, reassemble
+        slot_model_ids = shared.model_id[indices]
+        values = torch.empty(B, dtype=torch.float32, device=device)
+        # Pre-allocate pair_logits on device
+        pair_logits = torch.empty(B, N_CELLS, N_CELLS, device=device)
+        for mid, m in enumerate(models):
+            mask = (slot_model_ids == mid)
+            if not mask.any():
+                continue
+            sub_idx = mask.nonzero(as_tuple=True)[0]
+            sub_batch = delta_buf[indices[sub_idx]].to(device, non_blocking=True)
+            v, pl, _, _ = m(sub_batch)
+            values[sub_idx] = v.squeeze(-1) if v.dim() > 1 else v
+            pair_logits[sub_idx] = pl
 
     # Write values (bulk copy, no Python loop)
     vals_cpu = values.cpu()
@@ -508,15 +552,39 @@ def _gpu_forward(model, device, delta_buf, needs_eval, needs_expand_flag,
 
 
 @torch.no_grad()
-def _gpu_tree_forward(model, device, shared):
-    """Run GPU forward for tree creation on flagged slots."""
+def _gpu_tree_forward(models, device, shared):
+    """Run GPU forward for tree creation on flagged slots.
+
+    Args:
+        models: single model or list/tuple of models.
+    """
+    if not isinstance(models, (list, tuple)):
+        models = [models]
+
     indices = shared.tree_needs_init.nonzero(as_tuple=True)[0]
     B = len(indices)
     if B == 0:
         return
 
-    batch = shared.tree_planes[indices].to(device, non_blocking=True)
-    values, pair_logits, _, _ = model(batch)
+    if len(models) == 1:
+        # Fast path: single model
+        batch = shared.tree_planes[indices].to(device, non_blocking=True)
+        values, pair_logits, _, _ = models[0](batch)
+    else:
+        # Multi-model: split by model_id
+        slot_model_ids = shared.model_id[indices]
+        values = torch.empty(B, dtype=torch.float32, device=device)
+        pair_logits = torch.empty(B, N_CELLS, N_CELLS, device=device)
+        for mid, m in enumerate(models):
+            mask = (slot_model_ids == mid)
+            if not mask.any():
+                continue
+            sub_idx = mask.nonzero(as_tuple=True)[0]
+            sub_batch = shared.tree_planes[indices[sub_idx]].to(
+                device, non_blocking=True)
+            v, pl, _, _ = m(sub_batch)
+            values[sub_idx] = v.squeeze(-1) if v.dim() > 1 else v
+            pair_logits[sub_idx] = pl
 
     # Compute pair_probs and marginals in bulk on GPU
     flat = pair_logits.reshape(B, -1)
@@ -814,6 +882,9 @@ class ParallelSelfPlayPool:
         # Barrier for workers + main to sync at round end
         self._round_end_barrier = mp.Barrier(n_workers + 1)
         self._next_game_id = mp.Value('i', 0)
+        # Eval mode flags (shared with workers)
+        self._eval_mode = mp.Value('i', 0)    # 1 = eval mode (no replace, no noise)
+        self._eval_temperature = mp.Value('f', 0.1)
 
     def start(self, game_dicts, next_game_id):
         """Spawn workers with initial game data. Call once."""
@@ -837,6 +908,7 @@ class ParallelSelfPlayPool:
                       self._round_stop,
                       self._new_round, self._round_end_barrier,
                       self._next_game_id,
+                      self._eval_mode, self._eval_temperature,
                       self.result_queue),
             )
             p.start()
@@ -1077,6 +1149,180 @@ class ParallelSelfPlayPool:
         far_pct = 100 * far_stones / max(total_stones, 1)
         return all_examples, draw_rate, a_win_rate, avg_moves, far_pct
 
+    def evaluate(self, models, device, n_games=256, n_sims=200,
+                 temperature=0.1):
+        """Play model-vs-model evaluation using the parallel infrastructure.
+
+        Args:
+            models: tuple of (current_model, anchor_model).
+            device: torch device.
+            n_games: total games (split 50/50 by side).
+            n_sims: MCTS simulations per turn.
+            temperature: move selection temperature.
+
+        Returns:
+            dict with wins, losses, draws, score (from current_model's POV).
+        """
+        if not self._alive:
+            raise RuntimeError("Pool not started")
+
+        current_model, anchor_model = models
+
+        # Configure eval mode
+        self._eval_mode.value = 1
+        self._eval_temperature.value = temperature
+        self._round_id.value = -1  # sentinel for eval
+        self._late_temperature.value = temperature
+        self._draw_penalty.value = 0.0
+        self._round_stop.value = 0
+
+        # Set model_for_player: first half current=A, second half current=B
+        half = n_games // 2
+        shared = self.shared
+        for gi in range(n_games):
+            if gi < half:
+                # current model plays A, anchor plays B
+                shared.model_for_player[gi, 1] = 0  # Player.A → model 0
+                shared.model_for_player[gi, 2] = 1  # Player.B → model 1
+            else:
+                # current model plays B, anchor plays A
+                shared.model_for_player[gi, 1] = 1  # Player.A → model 1
+                shared.model_for_player[gi, 2] = 0  # Player.B → model 0
+
+        # Reset sync state
+        self.sync['error'].value = 0
+
+        sync = self.sync
+        result_queue = self.result_queue
+
+        # Signal workers to start
+        self._new_round.set()
+
+        # Track results
+        wins = losses = draws = 0
+        games_completed = 0
+        total_target = n_games
+
+        pbar = tqdm(total=total_target, desc="Anchor eval", unit="game")
+
+        # Map game_id → which side current_model played
+        # Workers report game_id in completed results
+        current_side = {}
+        # Games 0..half-1: current=A; half..n_games-1: current=B
+        # game_ids match global_idx at start (slot.game_id = next_game_id + gi)
+
+        try:
+            while games_completed < total_target:
+                # === Tree creation phase ===
+                sync['tree_request_ready'].wait()
+                sync['tree_request_ready'].clear()
+
+                if sync['error'].value:
+                    _drain_errors(result_queue)
+                    raise RuntimeError("Worker process failed")
+
+                _gpu_tree_forward([current_model, anchor_model], device,
+                                  shared)
+                sync['tree_results_ready'].set()
+
+                # === Sim loop ===
+                for sim in range(n_sims):
+                    buf_idx = sim % 2
+                    sync['deltas_ready'][buf_idx].wait()
+                    sync['deltas_ready'][buf_idx].clear()
+
+                    if sync['error'].value:
+                        _drain_errors(result_queue)
+                        raise RuntimeError("Worker process failed")
+
+                    _gpu_forward([current_model, anchor_model], device,
+                                 shared.delta[buf_idx],
+                                 shared.needs_eval[buf_idx],
+                                 shared.needs_expand_flag[buf_idx],
+                                 shared)
+                    sync['results_ready'].set()
+
+                # === Collect results ===
+                for _ in range(self.n_workers):
+                    while True:
+                        try:
+                            msg = result_queue.get(timeout=10)
+                            break
+                        except queue.Empty:
+                            dead = [
+                                (i, p.exitcode)
+                                for i, p in enumerate(self.workers)
+                                if not p.is_alive()
+                            ]
+                            if dead:
+                                info = ", ".join(
+                                    f"worker {i} exit={c}" for i, c in dead)
+                                raise RuntimeError(
+                                    f"Worker process(es) died: {info}")
+                    if msg[0] == 'error':
+                        raise RuntimeError(
+                            f"Worker {msg[1]} failed:\n{msg[2]}")
+
+                    _, wid, completed, slot_data, _, _ = msg
+                    for c in completed:
+                        gid = c['game_id']
+                        w = c['winner']
+                        # Determine if current_model won
+                        # game_id was set at init: gi = game_id (for fresh
+                        # games). gi < half means current=A.
+                        gi = gid  # game_id == global_idx for eval
+                        is_current_a = (gi < half)
+                        if w == Player.NONE:
+                            draws += 1
+                        elif (w == Player.A) == is_current_a:
+                            wins += 1
+                        else:
+                            losses += 1
+                        games_completed += 1
+                        pbar.update(1)
+
+                if games_completed >= total_target:
+                    break
+
+        finally:
+            # Signal workers to stop the eval round
+            self._round_stop.value = 1
+            self._new_round.clear()
+            sync['results_ready'].set()
+            sync['tree_results_ready'].set()
+            for ev in sync['deltas_ready']:
+                ev.set()
+            try:
+                sync['worker_barrier'].abort()
+            except Exception:
+                pass
+            try:
+                self._round_end_barrier.wait(timeout=10)
+            except Exception:
+                pass
+            try:
+                sync['worker_barrier'].reset()
+            except Exception:
+                pass
+            sync['results_ready'].clear()
+            sync['tree_results_ready'].clear()
+            for ev in sync['deltas_ready']:
+                ev.clear()
+            sync['tree_request_ready'].clear()
+            pbar.close()
+
+            # Restore self-play mode and re-init games for next round
+            self._eval_mode.value = 0
+            # Reset model_for_player to all-zero (single model)
+            shared.model_for_player.fill_(0)
+
+        total = max(wins + losses + draws, 1)
+        score = (wins + 0.5 * draws) / total
+        print(f"  vs Anchor: {wins}W / {losses}L / {draws}D "
+              f"= {100 * score:.1f}% score")
+        return {"wins": wins, "losses": losses, "draws": draws,
+                "score": score}
+
     def shutdown(self):
         """Stop all workers permanently and clean up."""
         if not self._alive:
@@ -1111,6 +1357,7 @@ def _pool_worker_fn(worker_id, n_workers, batch_size, n_sims,
                     round_stop,
                     new_round_event, round_end_barrier,
                     next_game_id_shared,
+                    eval_mode_val, eval_temp_val,
                     result_queue):
     """Persistent worker: stays alive across rounds."""
     try:
@@ -1122,6 +1369,7 @@ def _pool_worker_fn(worker_id, n_workers, batch_size, n_sims,
             round_stop,
             new_round_event, round_end_barrier,
             next_game_id_shared,
+            eval_mode_val, eval_temp_val,
             result_queue)
     except Exception:
         sync['error'].value = 1
@@ -1143,6 +1391,7 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                       round_stop,
                       new_round_event, round_end_barrier,
                       next_game_id_shared,
+                      eval_mode_val, eval_temp_val,
                       result_queue):
     """Inner loop for persistent pool worker."""
     games_per_worker = batch_size // n_workers
@@ -1193,6 +1442,21 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
         round_id = round_id_val.value
         late_temperature = late_temp_val.value
         draw_penalty = draw_penalty_val.value
+        is_eval = bool(eval_mode_val.value)
+        eval_temperature = eval_temp_val.value
+
+        # In eval mode, save self-play state and create fresh games
+        saved_slots = None
+        if is_eval:
+            saved_slots = [(s.game, s.game_id, s.examples, s.turn_number,
+                            s.tree) for s in slots]
+            for i, slot in enumerate(slots):
+                gi = my_start + i
+                slot.game = _new_game()
+                slot.game_id = gi  # use global index as game_id
+                slot.examples = []
+                slot.turn_number = 0
+                slot.tree = None
 
         # ---- Inner turn loop ----
         while not stop_flag.value and not round_stop.value:
@@ -1200,6 +1464,7 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
             shared_bufs.tree_needs_init[my_start:my_end] = False
             for i, slot in enumerate(slots):
                 gi = my_start + i
+                _write_model_id(shared_bufs, slot, gi)
                 if slot.tree is None and not slot.game.game_over \
                    and slot.game.move_count < MAX_GAME_MOVES:
                     if hasattr(slot.game, 'to_planes_tensor'):
@@ -1233,7 +1498,7 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                         shared_bufs.tree_pair_probs[gi].float(),
                         shared_bufs.tree_marginals[gi].clone(),
                         shared_bufs.tree_planes[gi].clone(),
-                        add_noise=True,
+                        add_noise=(not is_eval),
                     )
 
             try:
@@ -1248,9 +1513,12 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
             try:
                 leaves = [None] * n_mine
                 for i, slot in enumerate(slots):
+                    gi = my_start + i
+                    if slot.tree is None:
+                        shared_bufs.needs_eval[0][gi] = False
+                        continue
                     leaves[i] = _sel(slot.tree, slot.game)
-                    _write_delta(shared_bufs, leaves[i], slot.tree,
-                                 my_start + i, 0)
+                    _write_delta(shared_bufs, leaves[i], slot.tree, gi, 0)
 
                 wb.wait()
                 if worker_id == 0:
@@ -1263,14 +1531,20 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                     next_leaves = [None] * n_mine
                     if sim < n_sims - 1:
                         for i, slot in enumerate(slots):
+                            gi = my_start + i
+                            if slot.tree is None:
+                                shared_bufs.needs_eval[buf_next][gi] = False
+                                continue
                             next_leaves[i] = _sel(slot.tree, slot.game)
                             _write_delta(shared_bufs, next_leaves[i],
-                                         slot.tree, my_start + i, buf_next)
+                                         slot.tree, gi, buf_next)
 
                     results_ready.wait()
 
                     for i, slot in enumerate(slots):
                         gi = my_start + i
+                        if leaves[i] is None:
+                            continue
                         if not shared_bufs.needs_eval[buf_cur][gi]:
                             _bp(slot.tree, leaves[i], 0.0)
                         else:
@@ -1299,8 +1573,13 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
             turn_far_total = 0
             turn_stones_total = 0
             for i, slot in enumerate(slots):
+                if slot.tree is None:
+                    continue  # game already finished (eval mode)
                 turn = slot.turn_number
-                temp = 1.0 if turn < 20 else late_temperature
+                if is_eval:
+                    temp = eval_temperature
+                else:
+                    temp = 1.0 if turn < 20 else late_temperature
 
                 if slot.game.moves_left_in_turn == 1:
                     cell = select_single_move(slot.tree)
@@ -1311,45 +1590,48 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                     moves = [s1, s2]
                     pv = get_pair_visits(slot.tree)
 
-                if hasattr(slot.game, 'to_board_dict'):
-                    bd = slot.game.to_board_dict()
-                else:
-                    bd = slot.game.board
-                cp = slot.game.current_player
-                cp_val = cp.value if hasattr(cp, 'value') else int(cp)
-                ex = {
-                    "board": json.dumps({
-                        f"{q},{r}": v.value if isinstance(v, Player)
-                        else int(v)
-                        for (q, r), v in bd.items()
-                    }),
-                    "current_player": cp_val,
-                    "pair_visits": json.dumps({
-                        f"{a},{b}": c for (a, b), c in pv.items()
-                    }),
-                    "value_target": 0.0,
-                    "move_count": slot.game.move_count,
-                    "moves_left": 0,
-                    "game_drawn": False,
-                    "game_id": slot.game_id,
-                    "round_id": round_id,
-                }
-                slot.examples.append(ex)
+                # Record training example (skip in eval mode)
+                if not is_eval:
+                    if hasattr(slot.game, 'to_board_dict'):
+                        bd = slot.game.to_board_dict()
+                    else:
+                        bd = slot.game.board
+                    cp = slot.game.current_player
+                    cp_val = cp.value if hasattr(cp, 'value') else int(cp)
+                    ex = {
+                        "board": json.dumps({
+                            f"{q},{r}": v.value if isinstance(v, Player)
+                            else int(v)
+                            for (q, r), v in bd.items()
+                        }),
+                        "current_player": cp_val,
+                        "pair_visits": json.dumps({
+                            f"{a},{b}": c for (a, b), c in pv.items()
+                        }),
+                        "value_target": 0.0,
+                        "move_count": slot.game.move_count,
+                        "moves_left": 0,
+                        "game_drawn": False,
+                        "game_id": slot.game_id,
+                        "round_id": round_id,
+                    }
+                    slot.examples.append(ex)
 
                 # Apply moves (track distance from existing stones)
                 for q, r in moves:
                     if slot.game.game_over:
                         break
-                    if hasattr(slot.game, 'get_occupied_set'):
-                        occ = slot.game.get_occupied_set()
-                    else:
-                        occ = frozenset(slot.game.board.keys())
-                    if occ:
-                        min_d = min(_hex_dist_torus(q, r, oq, or_)
-                                    for oq, or_ in occ)
-                        turn_stones_total += 1
-                        if min_d > 2:
-                            turn_far_total += 1
+                    if not is_eval:
+                        if hasattr(slot.game, 'get_occupied_set'):
+                            occ = slot.game.get_occupied_set()
+                        else:
+                            occ = frozenset(slot.game.board.keys())
+                        if occ:
+                            min_d = min(_hex_dist_torus(q, r, oq, or_)
+                                        for oq, or_ in occ)
+                            turn_stones_total += 1
+                            if min_d > 2:
+                                turn_far_total += 1
                     slot.game.make_move(q, r)
 
                 slot.turn_number += 1
@@ -1366,19 +1648,20 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                     else:
                         winner = Player.NONE
 
-                    total_m = slot.game.move_count
-                    is_drawn = (winner == Player.NONE)
-                    for e in slot.examples:
-                        e["round_id"] = round_id
-                        e["moves_left"] = total_m - e["move_count"]
-                        e["game_drawn"] = is_drawn
-                        cp_e = Player(e["current_player"])
-                        if is_drawn:
-                            e["value_target"] = -draw_penalty
-                        elif cp_e == winner:
-                            e["value_target"] = 1.0
-                        else:
-                            e["value_target"] = -1.0
+                    if not is_eval:
+                        total_m = slot.game.move_count
+                        is_drawn = (winner == Player.NONE)
+                        for e in slot.examples:
+                            e["round_id"] = round_id
+                            e["moves_left"] = total_m - e["move_count"]
+                            e["game_drawn"] = is_drawn
+                            cp_e = Player(e["current_player"])
+                            if is_drawn:
+                                e["value_target"] = -draw_penalty
+                            elif cp_e == winner:
+                                e["value_target"] = 1.0
+                            else:
+                                e["value_target"] = -1.0
 
                     if hasattr(slot.game, 'to_board_dict'):
                         bd_src = slot.game.to_board_dict()
@@ -1393,25 +1676,40 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                     completed.append({
                         'examples': slot.examples,
                         'winner': winner,
-                        'move_count': total_m,
+                        'move_count': slot.game.move_count,
                         'game_id': slot.game_id,
                         'turn_number': slot.turn_number,
                         'final_board': final_board,
                     })
 
-                    slot.game = _new_game()
-                    slot.game_id = next_gid
-                    next_gid += n_workers
-                    slot.examples = []
-                    slot.turn_number = 0
+                    if is_eval:
+                        # Don't replace — leave slot dead
+                        pass
+                    else:
+                        slot.game = _new_game()
+                        slot.game_id = next_gid
+                        next_gid += n_workers
+                        slot.examples = []
+                        slot.turn_number = 0
 
             result_queue.put(('turn_done', worker_id, completed,
                               [_serialize_slot(s) for s in slots],
                               turn_far_total, turn_stones_total))
 
+        # In eval mode, restore self-play game state
+        if is_eval and saved_slots is not None:
+            for i, (game, gid, exs, tn, tree) in enumerate(saved_slots):
+                slots[i].game = game
+                slots[i].game_id = gid
+                slots[i].examples = exs
+                slots[i].turn_number = tn
+                slots[i].tree = tree
+            saved_slots = None
+
         # Round done -- update shared next_game_id and wait at barrier
-        next_game_id_shared.value = max(
-            next_game_id_shared.value, next_gid)
+        if not is_eval:
+            next_game_id_shared.value = max(
+                next_game_id_shared.value, next_gid)
         try:
             round_end_barrier.wait(timeout=10)
         except (BrokenBarrierError, Exception):
