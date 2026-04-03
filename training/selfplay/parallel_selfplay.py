@@ -229,7 +229,9 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
             tree_request_ready.set()
 
         # Step 3: wait for GPU results
-        tree_results_ready.wait()
+        if not _wait_event_worker(tree_results_ready, stop_flag, None,
+                                  label=f"w{worker_id}:tree_results"):
+            break
 
         if stop_flag and stop_flag.value:
             break
@@ -280,7 +282,10 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                                      my_start + i, buf_next)
 
                 # Wait for GPU results for current sim
-                results_ready.wait()
+                if not _wait_event_worker(
+                        results_ready, stop_flag, None,
+                        label=f"w{worker_id}:results sim={sim}"):
+                    break
 
                 # Backprop current sim
                 for i, slot in enumerate(slots):
@@ -680,7 +685,8 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
         while games_completed < target:
             # === Tree creation phase: GPU forward for new trees ===
             _t0 = time.monotonic()
-            sync['tree_request_ready'].wait()
+            _wait_event_main(sync['tree_request_ready'], workers,
+                             label="tree_request_ready")
             sync['tree_request_ready'].clear()
             t_wait += time.monotonic() - _t0
 
@@ -700,7 +706,8 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
 
                 # Wait for workers to finish writing deltas
                 _t0 = time.monotonic()
-                sync['deltas_ready'][buf_idx].wait()
+                _wait_event_main(sync['deltas_ready'][buf_idx], workers,
+                                 label=f"deltas_ready[{buf_idx}] sim={sim}")
                 sync['deltas_ready'][buf_idx].clear()
                 t_wait += time.monotonic() - _t0
 
@@ -840,6 +847,56 @@ def _drain_errors(queue):
             break
 
 
+# ---------------------------------------------------------------------------
+# Safe event waiting with hang detection
+# ---------------------------------------------------------------------------
+
+_MAIN_WAIT_TIMEOUT = 30  # seconds before checking worker health
+_WORKER_WAIT_TIMEOUT = 30  # seconds before checking stop flags
+
+
+def _check_workers_alive(workers):
+    """Return list of (worker_id, exitcode) for dead workers."""
+    return [(i, p.exitcode) for i, p in enumerate(workers) if not p.is_alive()]
+
+
+def _wait_event_main(event, workers, label="event", timeout=_MAIN_WAIT_TIMEOUT):
+    """Wait on an mp.Event from the main thread, checking worker health.
+
+    Raises RuntimeError if workers die while we're waiting.
+    """
+    total_waited = 0.0
+    while not event.wait(timeout=timeout):
+        total_waited += timeout
+        dead = _check_workers_alive(workers)
+        if dead:
+            info = ", ".join(f"worker {i} exit={c}" for i, c in dead)
+            raise RuntimeError(
+                f"HANG DETECTED waiting on '{label}' after {total_waited:.0f}s: "
+                f"worker(s) died: {info}")
+        print(f"  [WARN] Main thread waiting on '{label}' for "
+              f"{total_waited:.0f}s — all {len(workers)} workers alive",
+              flush=True)
+
+
+def _wait_event_worker(event, stop_flag, round_stop, label="event",
+                       timeout=_WORKER_WAIT_TIMEOUT):
+    """Wait on an mp.Event from a worker, checking stop flags.
+
+    Returns True if the event fired, False if a stop was requested.
+    """
+    total_waited = 0.0
+    while not event.wait(timeout=timeout):
+        total_waited += timeout
+        if (stop_flag and stop_flag.value) or (round_stop and round_stop.value):
+            return False
+        print(f"  [WARN] Worker waiting on '{label}' for "
+              f"{total_waited:.0f}s — stop={stop_flag.value if stop_flag else '?'}, "
+              f"round_stop={round_stop.value if round_stop else '?'}",
+              flush=True)
+    return True
+
+
 def _save_pending(slots_data, next_game_id, data_dir):
     """Save pending games for next round."""
     data = {"games": slots_data, "next_game_id": next_game_id}
@@ -968,7 +1025,8 @@ class ParallelSelfPlayPool:
             while games_completed < target:
                 # === Tree creation phase ===
                 _t0 = time.monotonic()
-                sync['tree_request_ready'].wait()
+                _wait_event_main(sync['tree_request_ready'], self.workers,
+                                 label="tree_request_ready")
                 sync['tree_request_ready'].clear()
                 t_wait += time.monotonic() - _t0
 
@@ -987,7 +1045,9 @@ class ParallelSelfPlayPool:
                     buf_idx = sim % 2
 
                     _t0 = time.monotonic()
-                    sync['deltas_ready'][buf_idx].wait()
+                    _wait_event_main(sync['deltas_ready'][buf_idx],
+                                     self.workers,
+                                     label=f"deltas_ready[{buf_idx}] sim={sim}")
                     sync['deltas_ready'][buf_idx].clear()
                     t_wait += time.monotonic() - _t0
 
@@ -1168,6 +1228,13 @@ class ParallelSelfPlayPool:
         if not self._alive:
             raise RuntimeError("Pool not started")
 
+        # Clamp n_games to batch_size: eval doesn't replace finished games,
+        # so we can never get more completions than batch_size.
+        if n_games > self.batch_size:
+            print(f"  [WARN] eval n_games ({n_games}) > batch_size "
+                  f"({self.batch_size}), clamping to {self.batch_size}")
+            n_games = self.batch_size
+
         current_model, anchor_model = models
 
         # Configure eval mode
@@ -1227,7 +1294,8 @@ class ParallelSelfPlayPool:
             while games_completed < total_target:
                 # === Tree creation phase ===
                 _t0 = time.monotonic()
-                sync['tree_request_ready'].wait()
+                _wait_event_main(sync['tree_request_ready'], self.workers,
+                                 label="eval:tree_request_ready")
                 sync['tree_request_ready'].clear()
                 t_wait += time.monotonic() - _t0
 
@@ -1246,7 +1314,9 @@ class ParallelSelfPlayPool:
                     buf_idx = sim % 2
 
                     _t0 = time.monotonic()
-                    sync['deltas_ready'][buf_idx].wait()
+                    _wait_event_main(
+                        sync['deltas_ready'][buf_idx], self.workers,
+                        label=f"eval:deltas_ready[{buf_idx}] sim={sim}")
                     sync['deltas_ready'][buf_idx].clear()
                     t_wait += time.monotonic() - _t0
 
@@ -1534,7 +1604,10 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
             if worker_id == 0:
                 tree_request_ready.set()
 
-            tree_results_ready.wait()
+            if not _wait_event_worker(tree_results_ready, stop_flag,
+                                      round_stop,
+                                      label=f"w{worker_id}:tree_results"):
+                break
 
             if stop_flag.value or round_stop.value:
                 break
@@ -1589,7 +1662,10 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                             _write_delta(shared_bufs, next_leaves[i],
                                          slot.tree, gi, buf_next)
 
-                    results_ready.wait()
+                    if not _wait_event_worker(
+                            results_ready, stop_flag, round_stop,
+                            label=f"w{worker_id}:results sim={sim}"):
+                        break
 
                     for i, slot in enumerate(slots):
                         gi = my_start + i
