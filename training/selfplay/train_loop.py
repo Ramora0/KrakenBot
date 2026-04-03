@@ -5,10 +5,12 @@ Usage:
 """
 
 import argparse
+import glob
 import json
 import math
 import os
 import random
+import sys
 import time
 
 import numpy as np
@@ -414,7 +416,7 @@ def _preprocess_round(parquet_path: str) -> dict:
 
 
 def load_selfplay_rounds(data_dir: str, current_round: int,
-                         window: int = 4, decay: float = 0.75,
+                         window: int = 12, oldest_weight: float = 0.5,
                          augment: bool = True,
                          sft_path: str = None, sft_weight: float = 0.3,
                          sft_max_examples: int = 50000) -> SelfPlayDataset:
@@ -423,6 +425,7 @@ def load_selfplay_rounds(data_dir: str, current_round: int,
     Each round is cached as a .pt file on first load — subsequent loads
     skip all JSON parsing and are near-instant.
     """
+    decay = oldest_weight ** (1.0 / max(window - 1, 1))
     rounds = range(max(0, current_round - window + 1), current_round + 1)
 
     all_planes, all_visits, all_values = [], [], []
@@ -558,12 +561,13 @@ def compute_selfplay_loss(value_pred, pair_logits, moves_left_pred, chain_pred,
 
 def train_one_epoch(model, optimizer, dataset, device, batch_size=512,
                     use_amp=False, scaler=None, grad_clip=5.0,
-                    value_weight=1.0):
+                    value_weight=1.0, train_samples=None):
     """Train one epoch on self-play data with weighted sampling."""
     model.train()
+    n_samples = min(train_samples, len(dataset)) if train_samples else len(dataset)
     sampler = WeightedRandomSampler(
         weights=dataset.weights,
-        num_samples=len(dataset),
+        num_samples=n_samples,
         replacement=True,
     )
     loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler,
@@ -1277,10 +1281,13 @@ def main():
                         help="MCTS sims for evaluation bot")
     parser.add_argument("--minimax-time", type=float, default=0.001,
                         help="Initial center time for crossover estimation")
-    parser.add_argument("--window", type=int, default=4,
+    parser.add_argument("--window", type=int, default=12,
                         help="Sliding window of rounds for training data")
-    parser.add_argument("--decay", type=float, default=0.75,
-                        help="Exponential weight decay per round age")
+    parser.add_argument("--oldest-weight", type=float, default=0.5,
+                        help="Sampling weight for the oldest sample relative to newest "
+                             "(decay = oldest_weight^(1/(window-1)))")
+    parser.add_argument("--train-samples", type=int, default=40000,
+                        help="Max samples drawn per training epoch (controls replay ratio)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Checkpoint to resume from")
     parser.add_argument("--output-dir", type=str,
@@ -1334,8 +1341,17 @@ def main():
         if not args.resume:
             parser.error("--refresh requires --resume to specify the model to restart from")
         import shutil
-        for d in [args.data_dir, args.output_dir, "wandb"]:
-            if os.path.isdir(d):
+        dirs = [d for d in [args.data_dir, args.output_dir, "wandb"]
+                if os.path.isdir(d)]
+        if dirs:
+            print("--refresh will delete:")
+            for d in dirs:
+                print(f"  {d}/")
+            resp = input("Proceed? [y/N] ").strip().lower()
+            if resp != 'y':
+                print("Aborted.")
+                sys.exit(0)
+            for d in dirs:
                 shutil.rmtree(d)
                 print(f"Deleted {d}/")
         print(f"Refresh: restarting from {args.resume}")
@@ -1395,6 +1411,32 @@ def main():
         num_graduations = ckpt.get("num_graduations", 0)
         anchor_round = ckpt.get("anchor_round", None)
         print(f"Auto-resumed from {ckpt_path} (round {start_round})")
+
+    # Clean up self-play data, caches, and pending games newer than resumed round
+    if start_round > 0 and not args.refresh:
+        resume_round = start_round - 1  # checkpoint's round
+        stale = []
+        for ext in ("*.parquet", "*.pt"):
+            for f in glob.glob(os.path.join(args.data_dir, f"round_{ext}")):
+                name = os.path.basename(f)
+                r = int(name.split("_")[1].split(".")[0])
+                if r > resume_round:
+                    stale.append(f)
+        stale.sort()
+        pending_path = os.path.join(args.data_dir, "pending.json")
+        if os.path.exists(pending_path):
+            stale.append(pending_path)
+        if stale:
+            print(f"Found {len(stale)} file(s) newer than round {resume_round}:")
+            for f in stale:
+                print(f"  {os.path.basename(f)}")
+            resp = input("Delete stale data? [y/N] ").strip().lower()
+            if resp == 'y':
+                for f in stale:
+                    os.remove(f)
+                    print(f"  Deleted {os.path.basename(f)}")
+            else:
+                print("Kept stale data (will be overwritten as new rounds run).")
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.data_dir, exist_ok=True)
@@ -1544,12 +1586,14 @@ def main():
                 cur_sft_weight = args.sft_weight
             sft_path = args.sft_path if cur_sft_weight > 0 else None
 
-            print(f"\n--- Training (window={args.window}, decay={args.decay}"
+            decay = args.oldest_weight ** (1.0 / max(args.window - 1, 1))
+            print(f"\n--- Training (window={args.window}, oldest_weight={args.oldest_weight}, "
+                  f"decay={decay:.4f}, train_samples={args.train_samples}"
                   f"{f', sft_weight={cur_sft_weight:.3f}' if sft_path else ''}) ---")
             t1 = time.time()
             dataset = load_selfplay_rounds(
                 args.data_dir, round_num,
-                window=args.window, decay=args.decay,
+                window=args.window, oldest_weight=args.oldest_weight,
                 sft_path=sft_path, sft_weight=cur_sft_weight,
                 sft_max_examples=args.sft_max_examples)
             losses = train_one_epoch(
@@ -1558,6 +1602,7 @@ def main():
                 use_amp=use_amp,
                 scaler=scaler,
                 value_weight=args.value_weight,
+                train_samples=args.train_samples,
             )
             avg_loss, avg_vloss, avg_ploss, avg_ml, avg_chain, avg_entropy = losses
             t_train = time.time() - t1
