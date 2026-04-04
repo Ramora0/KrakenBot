@@ -1039,10 +1039,10 @@ def evaluate_crossover(model, device, n_games=100, n_sims=200,
 # Anchor-based Elo evaluation
 # ---------------------------------------------------------------------------
 
-def compute_elo(num_graduations: int, score: float) -> float:
-    """Cumulative Elo from graduations and current anchor win rate."""
+def compute_elo(banked_elo: float, score: float) -> float:
+    """Cumulative Elo from banked Elo and current anchor win rate."""
     score = max(0.001, min(0.999, score))
-    return 200 * num_graduations + 400 * math.log10(score / (1 - score))
+    return banked_elo + 400 * math.log10(score / (1 - score))
 
 
 def _run_batched_sims(
@@ -1240,13 +1240,14 @@ def evaluate_vs_anchor(
 # Anchor checkpoint management
 # ---------------------------------------------------------------------------
 
-def save_anchor(model, output_dir, num_graduations, anchor_round):
+def save_anchor(model, output_dir, num_graduations, anchor_round, banked_elo=0.0):
     """Atomically save anchor checkpoint."""
     os.makedirs(output_dir, exist_ok=True)
     ckpt = {
         "model_state_dict": model.state_dict(),
         "num_graduations": num_graduations,
         "anchor_round": anchor_round,
+        "banked_elo": banked_elo,
     }
     path = os.path.join(output_dir, "anchor.pt")
     tmp = path + ".tmp"
@@ -1255,10 +1256,11 @@ def save_anchor(model, output_dir, num_graduations, anchor_round):
     print(f"Anchor saved: {path} (round {anchor_round})")
 
 
-def load_anchor_model(model, args, device, num_graduations, anchor_round):
+def load_anchor_model(model, args, device, num_graduations, anchor_round,
+                      banked_elo=0.0):
     """Load anchor model from anchor.pt, or create from current model.
 
-    Returns (anchor_model, num_graduations, anchor_round).
+    Returns (anchor_model, num_graduations, anchor_round, banked_elo).
     """
     anchor_path = os.path.join(args.output_dir, "anchor.pt")
     anchor_model = HexResNet(
@@ -1270,16 +1272,20 @@ def load_anchor_model(model, args, device, num_graduations, anchor_round):
         anchor_model.load_state_dict(ckpt["model_state_dict"], strict=False)
         num_graduations = ckpt.get("num_graduations", num_graduations)
         anchor_round = ckpt.get("anchor_round", anchor_round)
+        # Backward compat: old anchors lack banked_elo, estimate from graduations
+        banked_elo = ckpt.get("banked_elo", 200.0 * num_graduations)
         print(f"Loaded anchor from {anchor_path} "
-              f"(round {anchor_round}, graduations={num_graduations})")
+              f"(round {anchor_round}, graduations={num_graduations}, "
+              f"banked_elo={banked_elo:.0f})")
     else:
         # No anchor exists — save current model as initial anchor
         anchor_model.load_state_dict(model.state_dict())
-        save_anchor(model, args.output_dir, num_graduations, anchor_round)
+        save_anchor(model, args.output_dir, num_graduations, anchor_round,
+                    banked_elo)
         print(f"Created initial anchor from current model")
 
     anchor_model.eval()
-    return anchor_model, num_graduations, anchor_round
+    return anchor_model, num_graduations, anchor_round, banked_elo
 
 
 # ---------------------------------------------------------------------------
@@ -1289,7 +1295,7 @@ def load_anchor_model(model, args, device, num_graduations, anchor_round):
 def save_checkpoint(model, optimizer, scaler, round_num, output_dir,
                     best_win_rate=0.0, crossover_time=None,
                     num_graduations=0, anchor_round=None,
-                    save_numbered=True):
+                    banked_elo=0.0, save_numbered=True):
     """Save model checkpoint atomically."""
     os.makedirs(output_dir, exist_ok=True)
     ckpt = {
@@ -1301,6 +1307,7 @@ def save_checkpoint(model, optimizer, scaler, round_num, output_dir,
         "crossover_time": crossover_time,
         "num_graduations": num_graduations,
         "anchor_round": anchor_round,
+        "banked_elo": banked_elo,
     }
 
     # Save numbered checkpoint only when requested (e.g. every 10 rounds)
@@ -1374,6 +1381,8 @@ def main():
                         help="Evaluate vs anchor every N rounds (default: 10)")
     parser.add_argument("--graduation-threshold", type=float, default=0.76,
                         help="Score threshold to graduate anchor (default: 0.76)")
+    parser.add_argument("--banked-elo", type=float, default=None,
+                        help="Override banked Elo (for correcting old runs)")
     parser.add_argument("--no-viewer", action="store_true",
                         help="Disable live game viewer")
     parser.add_argument("--viewer-port", type=int, default=8765,
@@ -1448,6 +1457,7 @@ def main():
     crossover_time = None
     num_graduations = 0
     anchor_round = None
+    banked_elo = 0.0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
@@ -1462,6 +1472,7 @@ def main():
             crossover_time = ckpt.get("crossover_time", None)
             num_graduations = ckpt.get("num_graduations", 0)
             anchor_round = ckpt.get("anchor_round", None)
+            banked_elo = ckpt.get("banked_elo", 200.0 * num_graduations)
             print(f"Resumed from {args.resume} (round {start_round})")
         else:
             print(f"Loaded model weights from {args.resume} (fresh optimizer)")
@@ -1478,6 +1489,7 @@ def main():
         crossover_time = ckpt.get("crossover_time", None)
         num_graduations = ckpt.get("num_graduations", 0)
         anchor_round = ckpt.get("anchor_round", None)
+        banked_elo = ckpt.get("banked_elo", 200.0 * num_graduations)
         print(f"Auto-resumed from {ckpt_path} (round {start_round})")
 
     # Clean up self-play data, caches, and pending games newer than resumed round
@@ -1512,8 +1524,13 @@ def main():
     # Load or create anchor model for evaluation
     anchor_model = None
     if not args.no_eval:
-        anchor_model, num_graduations, anchor_round = load_anchor_model(
-            model, args, device, num_graduations, anchor_round)
+        anchor_model, num_graduations, anchor_round, banked_elo = load_anchor_model(
+            model, args, device, num_graduations, anchor_round, banked_elo)
+
+    # Allow manual override of banked Elo for correcting old runs
+    if args.banked_elo is not None:
+        banked_elo = args.banked_elo
+        print(f"Overriding banked Elo to {banked_elo:.0f}")
 
     # wandb
     use_wandb = (not args.no_wandb) and HAS_WANDB
@@ -1551,7 +1568,7 @@ def main():
             n_games=args.eval_games, n_sims=args.eval_sims,
         )
         score = eval_result["score"]
-        cumulative_elo = compute_elo(num_graduations, score)
+        cumulative_elo = compute_elo(banked_elo, score)
         print(f"  Score: {100*score:.1f}% | Elo: {cumulative_elo:.0f} "
               f"(graduations={num_graduations})")
         if use_wandb:
@@ -1703,6 +1720,7 @@ def main():
                 crossover_time=crossover_time,
                 num_graduations=num_graduations,
                 anchor_round=anchor_round,
+                banked_elo=banked_elo,
                 save_numbered=is_eval_round)
 
             # --- 4. Evaluate vs anchor (every eval_every rounds) ---
@@ -1733,19 +1751,20 @@ def main():
                 t_eval = time.time() - t2
 
                 score = eval_result["score"]
-                cumulative_elo = compute_elo(num_graduations, score)
+                cumulative_elo = compute_elo(banked_elo, score)
                 print(f"  Score: {100*score:.1f}% | Elo: {cumulative_elo:.0f} "
                       f"(graduations={num_graduations})")
 
                 # Graduation check
                 if score >= args.graduation_threshold:
+                    banked_elo = cumulative_elo
                     num_graduations += 1
                     anchor_round = round_num
                     save_anchor(model, args.output_dir,
-                                num_graduations, anchor_round)
+                                num_graduations, anchor_round, banked_elo)
                     anchor_model.load_state_dict(model.state_dict())
                     anchor_model.eval()
-                    cumulative_elo = compute_elo(num_graduations, 0.5)
+                    cumulative_elo = compute_elo(banked_elo, 0.5)
                     print(f"  *** GRADUATED! New anchor = round {round_num}, "
                           f"graduations={num_graduations}, "
                           f"Elo={cumulative_elo:.0f} ***")
