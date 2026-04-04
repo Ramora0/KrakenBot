@@ -510,6 +510,74 @@ def load_selfplay_rounds(data_dir: str, current_round: int,
     return dataset
 
 
+def compute_diversity_stats(examples: list[dict]) -> dict:
+    """Compute position diversity metrics for a round of self-play examples.
+
+    Returns dict with:
+        visit_entropy_mean: mean Shannon entropy (nats) of visit distributions
+                            on full-search turns only
+        visit_entropy_std:  std dev of the above
+        unique_position_ratio: unique D6-canonical positions / total positions
+    """
+    from model.symmetry import PERMS
+
+    N = BOARD_SIZE
+    NN = N * N
+
+    # --- Visit entropy (full-search only) ---
+    entropies = []
+    for ex in examples:
+        if not ex.get("full_search", True):
+            continue
+        pair_visits = json.loads(ex["pair_visits"])
+        total = sum(pair_visits.values())
+        if total <= 0:
+            continue
+        ent = 0.0
+        for count in pair_visits.values():
+            p = count / total
+            if p > 0:
+                ent -= p * math.log(p)
+        entropies.append(ent)
+
+    ent_mean = sum(entropies) / len(entropies) if entropies else 0.0
+    ent_std = (sum((e - ent_mean) ** 2 for e in entropies)
+               / len(entropies)) ** 0.5 if len(entropies) > 1 else 0.0
+
+    # --- D6-canonical unique positions ---
+    canonical_set = set()
+    for ex in examples:
+        board_raw = json.loads(ex["board"])
+        # Encode as tuple of (flat_idx, player) sorted by flat_idx
+        cells = []
+        for k, v in board_raw.items():
+            q, r = (int(x) for x in k.split(","))
+            cells.append((q * N + r, v))
+        cells.sort()
+        cells_tuple = tuple(cells)
+
+        # Find lex-min over all 12 D6 transforms
+        canon = cells_tuple
+        for k in range(1, 12):
+            perm = PERMS[k]
+            transformed = tuple(sorted((int(perm[f]), v) for f, v in cells))
+            if transformed < canon:
+                canon = transformed
+        canonical_set.add(canon)
+
+    n_total = len(examples)
+    unique_ratio = len(canonical_set) / n_total if n_total > 0 else 0.0
+
+    return {
+        "visit_entropy_mean": ent_mean,
+        "visit_entropy_std": ent_std,
+        "unique_position_ratio": unique_ratio,
+        "unique_positions": len(canonical_set),
+        "total_positions": n_total,
+        "full_search_positions": len(entropies),
+    }
+
+
 def compute_selfplay_loss(value_pred, pair_logits, moves_left_pred, chain_pred,
                           visit_dist, value_target,
                           moves_left_target, draw_mask,
@@ -1579,6 +1647,18 @@ def main():
             model.float()
             t_gen = time.time() - t0
 
+            # --- Diversity stats ---
+            diversity = compute_diversity_stats(examples)
+            print(f"\n--- Diversity ---")
+            print(f"  Visit entropy (full-search): "
+                  f"{diversity['visit_entropy_mean']:.3f} "
+                  f"± {diversity['visit_entropy_std']:.3f} nats "
+                  f"({diversity['full_search_positions']} positions)")
+            print(f"  Unique positions (D6-canonical): "
+                  f"{diversity['unique_positions']:,} / "
+                  f"{diversity['total_positions']:,} "
+                  f"({100 * diversity['unique_position_ratio']:.1f}%)")
+
             # --- 2. Train ---
             # Anneal SFT weight linearly to 0
             if args.sft_path and args.sft_anneal_rounds > 0:
@@ -1705,6 +1785,10 @@ def main():
                     "time_gen": t_gen,
                     "time_train": t_train,
                     "time_eval": t_eval,
+                    "diversity/visit_entropy": diversity["visit_entropy_mean"],
+                    "diversity/visit_entropy_std": diversity["visit_entropy_std"],
+                    "diversity/unique_position_ratio": diversity["unique_position_ratio"],
+                    "diversity/unique_positions": diversity["unique_positions"],
                 }
                 if eval_result is not None:
                     log_data["eval/score"] = eval_result["score"]
