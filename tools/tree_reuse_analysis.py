@@ -180,45 +180,38 @@ def main():
                            ("90th", 9 * n // 10)]:
         print(f"  {pct_label} percentile: {fracs[idx]:.1%}")
 
-    # --- Nodes needed to reach X% of simulations ---
+    # --- Fraction of positions where best child has X%+ of visits ---
     thresholds = [0.90, 0.80, 0.70, 0.60, 0.50, 0.40, 0.30, 0.20]
 
     print(f"\n{'='*60}")
-    print("Avg # of top nodes needed to cover X% of simulations")
+    print("Fraction of positions where best child has X%+ of visits")
     print(f"{'='*60}")
-    print(f"  {'Threshold':<12} {'Avg nodes':>10} {'Median':>10} "
-          f"{'10th pct':>10} {'90th pct':>10}")
-    print(f"  {'-'*52}")
+    print(f"  {'Threshold':<12} {'Fraction':>10} {'Count':>10}")
+    print(f"  {'-'*34}")
 
+    n = len(all_results)
     for thr in thresholds:
-        counts = sorted(
-            nodes_for_threshold(r["sorted_counts"], r["total_sims"], thr)
-            for r in all_results
+        count = sum(
+            1 for r in all_results
+            if r["sorted_counts"][0] / r["total_sims"] >= thr
         )
-        n = len(counts)
-        avg = sum(counts) / n
-        med = counts[n // 2]
-        p10 = counts[n // 10]
-        p90 = counts[9 * n // 10]
-        print(f"  {thr:>6.0%}        {avg:>10.1f} {med:>10} {p10:>10} {p90:>10}")
+        print(f"  {thr:>6.0%}        {count/n:>10.1%} {count:>10,}")
 
     # Same breakdown by game phase
     for phase_label, pred in phases:
         subset = [r for r in all_results if pred(r)]
         if not subset:
             continue
+        ns = len(subset)
         print(f"\n  -- {phase_label} --")
-        print(f"  {'Threshold':<12} {'Avg nodes':>10} {'Median':>10}")
-        print(f"  {'-'*34}")
+        print(f"  {'Threshold':<12} {'Fraction':>10}")
+        print(f"  {'-'*24}")
         for thr in thresholds:
-            counts = [
-                nodes_for_threshold(r["sorted_counts"], r["total_sims"], thr)
-                for r in subset
-            ]
-            avg = sum(counts) / len(counts)
-            counts.sort()
-            med = counts[len(counts) // 2]
-            print(f"  {thr:>6.0%}        {avg:>10.1f} {med:>10}")
+            count = sum(
+                1 for r in subset
+                if r["sorted_counts"][0] / r["total_sims"] >= thr
+            )
+            print(f"  {thr:>6.0%}        {count/ns:>10.1%}")
 
 
 if __name__ == "__main__":
