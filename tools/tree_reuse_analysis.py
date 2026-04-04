@@ -30,7 +30,7 @@ def parse_pair_visits(pv_str: str) -> dict[tuple[int, int], int]:
 
 
 def analyze_position(pair_visits: dict[tuple[int, int], int]):
-    """Return (total_sims, max_visits, top3_visits) for one position."""
+    """Return (total_sims, max_visits, top3_visits, sorted_counts) for one position."""
     if not pair_visits:
         return None
     total = sum(pair_visits.values())
@@ -39,7 +39,19 @@ def analyze_position(pair_visits: dict[tuple[int, int], int]):
     sorted_counts = sorted(pair_visits.values(), reverse=True)
     top1 = sorted_counts[0]
     top3 = sum(sorted_counts[:3])
-    return total, top1, top3
+    return total, top1, top3, sorted_counts
+
+
+def nodes_for_threshold(sorted_counts: list[int], total: int,
+                        threshold: float) -> int:
+    """How many top nodes needed to reach threshold fraction of total sims."""
+    target = total * threshold
+    cumsum = 0
+    for i, c in enumerate(sorted_counts):
+        cumsum += c
+        if cumsum >= target:
+            return i + 1
+    return len(sorted_counts)
 
 
 def analyze_round(path: str) -> list[dict]:
@@ -50,11 +62,12 @@ def analyze_round(path: str) -> list[dict]:
         stats = analyze_position(pv)
         if stats is None:
             continue
-        total, top1, top3 = stats
+        total, top1, top3, sorted_counts = stats
         results.append({
             "total_sims": total,
             "chosen_sims": top1,
             "top3_sims": top3,
+            "sorted_counts": sorted_counts,
             "n_pairs": len(pv),
             "full_search": bool(row.get("full_search", True)),
             "move_count": int(row.get("move_count", 0)),
@@ -166,6 +179,46 @@ def main():
                            ("50th", n // 2), ("75th", 3 * n // 4),
                            ("90th", 9 * n // 10)]:
         print(f"  {pct_label} percentile: {fracs[idx]:.1%}")
+
+    # --- Nodes needed to reach X% of simulations ---
+    thresholds = [0.90, 0.80, 0.70, 0.60, 0.50, 0.40, 0.30, 0.20]
+
+    print(f"\n{'='*60}")
+    print("Avg # of top nodes needed to cover X% of simulations")
+    print(f"{'='*60}")
+    print(f"  {'Threshold':<12} {'Avg nodes':>10} {'Median':>10} "
+          f"{'10th pct':>10} {'90th pct':>10}")
+    print(f"  {'-'*52}")
+
+    for thr in thresholds:
+        counts = sorted(
+            nodes_for_threshold(r["sorted_counts"], r["total_sims"], thr)
+            for r in all_results
+        )
+        n = len(counts)
+        avg = sum(counts) / n
+        med = counts[n // 2]
+        p10 = counts[n // 10]
+        p90 = counts[9 * n // 10]
+        print(f"  {thr:>6.0%}        {avg:>10.1f} {med:>10} {p10:>10} {p90:>10}")
+
+    # Same breakdown by game phase
+    for phase_label, pred in phases:
+        subset = [r for r in all_results if pred(r)]
+        if not subset:
+            continue
+        print(f"\n  -- {phase_label} --")
+        print(f"  {'Threshold':<12} {'Avg nodes':>10} {'Median':>10}")
+        print(f"  {'-'*34}")
+        for thr in thresholds:
+            counts = [
+                nodes_for_threshold(r["sorted_counts"], r["total_sims"], thr)
+                for r in subset
+            ]
+            avg = sum(counts) / len(counts)
+            counts.sort()
+            med = counts[len(counts) // 2]
+            print(f"  {thr:>6.0%}        {avg:>10.1f} {med:>10}")
 
 
 if __name__ == "__main__":
