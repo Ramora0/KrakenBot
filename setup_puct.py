@@ -19,8 +19,8 @@ extensions = [
 
 setup(
     ext_modules=cythonize(extensions, compiler_directives={
-        "boundscheck": False,
-        "wraparound": False,
+        "boundscheck": True,
+        "wraparound": True,
         "cdivision": True,
     }),
 )

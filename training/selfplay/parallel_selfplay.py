@@ -5,8 +5,8 @@ Main process does full batch-256 GPU forward passes.
 One-sim-delayed pipeline overlaps CPU and GPU work.
 
 Architecture:
-  Workers: backprop(K-1) + select(K) → write deltas to shared buf
-  Main:    read deltas → GPU forward(K) → write results
+  Workers: backprop(K-1) + select(K) -> write deltas to shared buf
+  Main:    read deltas -> GPU forward(K) -> write results
   Pipeline: workers do CPU for sim K+1 while GPU runs sim K.
 """
 
@@ -100,7 +100,7 @@ class SharedBuffers:
         self.model_id = torch.zeros(
             batch_size, dtype=torch.int8).share_memory_()
         # Per-slot model assignment: model_for_player[gi, player_int]
-        # Maps (game, player) → model_id. Set by main at init.
+        # Maps (game, player) -> model_id. Set by main at init.
         # player_int: 1=Player.A, 2=Player.B
         self.model_for_player = torch.zeros(
             batch_size, 3, dtype=torch.int8).share_memory_()  # index 0 unused
@@ -120,8 +120,8 @@ def _create_sync(n_workers):
         'results_ready': mp.Event(),
         'error': mp.Value('i', 0),  # error flag
         'stop': mp.Value('i', 0),   # set to 1 when main wants workers to exit
-        'tree_request_ready': mp.Event(),   # workers → main: tree planes written
-        'tree_results_ready': mp.Event(),   # main → workers: tree NN results ready
+        'tree_request_ready': mp.Event(),   # workers -> main: tree planes written
+        'tree_results_ready': mp.Event(),   # main -> workers: tree NN results ready
     }
 
 
@@ -145,6 +145,9 @@ def _worker_fn(worker_id, n_workers, batch_size, n_sims,
                late_temperature, draw_penalty,
                result_queue):
     """Worker process: owns games/trees, does select + backprop."""
+    import faulthandler
+    import sys
+    faulthandler.enable(file=sys.stderr)
     try:
         _worker_loop(worker_id, n_workers, batch_size, n_sims,
                      game_dicts, next_game_id_start,
@@ -375,7 +378,7 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                 slot.game.make_move(q, r)
 
             slot.turn_number += 1
-            slot.tree = None
+            _clear_tree(slot)
             slot.sims_done = 0
 
             # Check completion
@@ -462,6 +465,21 @@ def _write_delta(shared, leaf, tree, global_idx, buf_idx):
     for gq, gr, ch in leaf.deltas:
         actual_ch = (1 - ch) if leaf.player_flipped else ch
         buf[global_idx, actual_ch, gq, gr] = 1.0
+
+
+def _clear_tree(slot):
+    """Drop the MCTS tree, clearing large tensors first.
+
+    On Windows, bulk deallocation of a deep tree containing PyTorch tensors
+    can trigger access violations when the multiprocessing Queue _feed thread
+    is alive.  Clearing the big tensors individually avoids that.
+    """
+    tree = slot.tree
+    if tree is not None:
+        tree.pair_probs = None
+        tree.root_planes = None
+        tree.root_pos._marginal = None
+    slot.tree = None
 
 
 def _serialize_slot(slot):
@@ -1275,12 +1293,12 @@ class ParallelSelfPlayPool:
         for gi in range(n_games):
             if gi < half:
                 # current model plays A, anchor plays B
-                shared.model_for_player[gi, 1] = 0  # Player.A → model 0
-                shared.model_for_player[gi, 2] = 1  # Player.B → model 1
+                shared.model_for_player[gi, 1] = 0  # Player.A -> model 0
+                shared.model_for_player[gi, 2] = 1  # Player.B -> model 1
             else:
                 # current model plays B, anchor plays A
-                shared.model_for_player[gi, 1] = 1  # Player.A → model 1
-                shared.model_for_player[gi, 2] = 0  # Player.B → model 0
+                shared.model_for_player[gi, 1] = 1  # Player.A -> model 1
+                shared.model_for_player[gi, 2] = 0  # Player.B -> model 0
 
         # Reset sync state
         self.sync['error'].value = 0
@@ -1298,7 +1316,7 @@ class ParallelSelfPlayPool:
 
         pbar = tqdm(total=total_target, desc="Anchor eval", unit="game")
 
-        # Map game_id → which side current_model played
+        # Map game_id -> which side current_model played
         # Workers report game_id in completed results
         current_side = {}
         # Games 0..half-1: current=A; half..n_games-1: current=B
@@ -1509,6 +1527,12 @@ def _pool_worker_fn(worker_id, n_workers, batch_size, n_sims,
                     turn_n_sims_val, is_full_search_val,
                     result_queue):
     """Persistent worker: stays alive across rounds."""
+    import faulthandler
+    import os
+    _fh_path = os.path.join(os.path.dirname(__file__),
+                            f"crash_worker{worker_id}.log")
+    _fh_file = open(_fh_path, "w")
+    faulthandler.enable(file=_fh_file, all_threads=True)
     try:
         _pool_worker_loop(
             worker_id, n_workers, batch_size, n_sims,
@@ -1797,7 +1821,7 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                     slot.game.make_move(q, r)
 
                 slot.turn_number += 1
-                slot.tree = None
+                _clear_tree(slot)
                 slot.sims_done = 0
 
                 if slot.game.game_over or \

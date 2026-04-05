@@ -995,7 +995,8 @@ def maybe_expand_leaf(
     child = PosNode()
     child.player = leaf.current_player
     child.is_root = False
-    child._marginal = marginal
+    # NOTE: marginal not stored – it is a view into shared memory that gets
+    # overwritten each sim, and nothing reads _marginal after expansion.
     child.value = nn_value
 
     _init_node_children(child.move_node, actions_priors)
