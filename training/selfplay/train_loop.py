@@ -1685,8 +1685,15 @@ def main():
                 cur_sft_weight = args.sft_weight
             sft_path = args.sft_path if cur_sft_weight > 0 else None
 
+            # KataGo-style single LR drop: 5x reduction at 2/3 of training
+            total_rounds = args.rounds if args.rounds else 200
+            lr_drop_round = (2 * total_rounds) // 3
+            cur_lr = args.lr / 5.0 if round_num >= lr_drop_round else args.lr
+            for pg in optimizer.param_groups:
+                pg['lr'] = cur_lr
+
             decay = args.oldest_weight ** (1.0 / max(args.window - 1, 1))
-            print(f"\n--- Training (window={args.window}, oldest_weight={args.oldest_weight}, "
+            print(f"\n--- Training (lr={cur_lr:.6f}, window={args.window}, oldest_weight={args.oldest_weight}, "
                   f"decay={decay:.4f}, train_samples={args.train_samples}"
                   f"{f', sft_weight={cur_sft_weight:.3f}' if sft_path else ''}) ---")
             t1 = time.time()
@@ -1788,6 +1795,7 @@ def main():
             if use_wandb:
                 log_data = {
                     "round": round_num,
+                    "lr": cur_lr,
                     "loss": avg_loss,
                     "value_loss": avg_vloss,
                     "policy_loss": avg_ploss,

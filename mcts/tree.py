@@ -705,6 +705,101 @@ def _expand_level2(
 
 
 # ---------------------------------------------------------------------------
+# Tree reuse: graft a previous turn's subtree into a fresh root
+# ---------------------------------------------------------------------------
+
+def graft_reused_subtree(
+    tree: MCTSTree,
+    old_child: PosNode,
+    add_noise: bool = True,
+) -> int:
+    """Graft statistics from a previous tree's child into a fresh root.
+
+    The old_child is a non-root PosNode (flat pair encoding) from the
+    previous turn's tree.  Its visit counts and values are transferred
+    into the new tree's two-level root structure.
+
+    Returns the number of visits successfully grafted.
+    """
+    if old_child is None or old_child.move_node.actions is None:
+        return 0
+
+    root_pos = tree.root_pos
+    root_node = root_pos.move_node
+    if root_node.actions is None:
+        return 0
+
+    _nc = tree.n_cells
+    old_mn = old_child.move_node
+    grafted_visits = 0
+
+    for i in range(old_mn.n):
+        V = old_mn.visits[i]
+        if V == 0:
+            continue
+
+        pair_action = old_mn.actions[i]
+        Q = old_mn.values[i]
+        is_term = old_mn.terminals[i]
+        term_val = old_mn.term_vals[i]
+
+        s1_idx = pair_action // _nc
+        s2_idx = pair_action % _nc
+
+        # Look up s1 in new root level-1
+        s1_local = root_node.action_map.get(s1_idx)
+        if s1_local is None:
+            continue
+
+        # Ensure level-2 node exists for this s1
+        l2_node = (root_node.level2 or {}).get(s1_idx)
+        if l2_node is None:
+            l2_node = _expand_level2(tree, root_pos, s1_idx, None,
+                                     add_noise=add_noise)
+        if l2_node is None or l2_node.actions is None:
+            continue
+
+        # Look up s2 in level-2
+        s2_local = l2_node.action_map.get(s2_idx)
+        if s2_local is None:
+            continue
+
+        # Transfer to level-2
+        l2_node.visits[s2_local] += V
+        l2_node.values[s2_local] += Q
+        l2_node.visit_count += V
+        if is_term:
+            l2_node.terminals[s2_local] = True
+            l2_node.term_vals[s2_local] = term_val
+            l2_node._has_terminal = True
+
+        # Aggregate to level-1 (visits and values only, NOT terminals --
+        # L1 terminals mean "game over after stone_1 alone")
+        root_node.visits[s1_local] += V
+        root_node.values[s1_local] += Q
+        root_node.visit_count += V
+
+        grafted_visits += V
+
+    # Transfer grandchildren (deeper PosNodes below old child)
+    if old_child.children:
+        if root_pos.children is None:
+            root_pos.children = {}
+        for pair_idx, grandchild in old_child.children.items():
+            s1 = pair_idx // _nc
+            s2 = pair_idx % _nc
+            s1_local = root_node.action_map.get(s1)
+            if s1_local is None:
+                continue
+            l2 = (root_node.level2 or {}).get(s1)
+            if l2 is None or l2.action_map.get(s2) is None:
+                continue
+            root_pos.children[(s1, s2)] = grandchild
+
+    return grafted_visits
+
+
+# ---------------------------------------------------------------------------
 # Select leaf (multi-ply)
 # ---------------------------------------------------------------------------
 

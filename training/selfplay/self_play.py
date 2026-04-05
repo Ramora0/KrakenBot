@@ -29,7 +29,7 @@ from mcts.tree import (
     MCTSTree, N_CELLS, NON_ROOT_TOP_K, create_trees_batched, select_leaf,
     expand_and_backprop, maybe_expand_leaf, get_pair_visits, get_single_visits,
     select_move_pair, select_single_move,
-    cpu_profile, _hex_dist_torus,
+    cpu_profile, _hex_dist_torus, graft_reused_subtree,
 )
 from model.resnet import BOARD_SIZE
 from game import ToroidalHexGame, TORUS_SIZE
@@ -56,6 +56,7 @@ class SelfPlaySlot:
     turn_number: int = 0
     game_id: int = 0
     examples: list[dict] = field(default_factory=list)
+    reuse_subtree: object = None
 
 
 class SelfPlayManager:
@@ -220,12 +221,18 @@ class SelfPlayManager:
             for _sim in range(turn_sims):
                 # -- Select + prepare group A (CPU) --
                 _t0 = time.monotonic()
-                leaves_A = [_sel(s.tree, s.game) for s in slots_A]
+                leaves_A = [
+                    _sel(s.tree, s.game) if s.sims_done < turn_sims
+                    else None
+                    for s in slots_A
+                ]
                 t_select += time.monotonic() - _t0
 
                 _t0 = time.monotonic()
                 eval_A = [(i, leaves_A[i]) for i in range(len(leaves_A))
-                          if not leaves_A[i].is_terminal and leaves_A[i].deltas]
+                          if leaves_A[i] is not None
+                          and not leaves_A[i].is_terminal
+                          and leaves_A[i].deltas]
                 batch_A_vals, batch_A_exp, raw_A = None, {}, None
                 if eval_A:
                     el = [lf for _, lf in eval_A]
@@ -238,12 +245,18 @@ class SelfPlayManager:
 
                 # -- While GPU processes A: select + prepare B (CPU) --
                 _t0 = time.monotonic()
-                leaves_B = [_sel(s.tree, s.game) for s in slots_B]
+                leaves_B = [
+                    _sel(s.tree, s.game) if s.sims_done < turn_sims
+                    else None
+                    for s in slots_B
+                ]
                 t_select += time.monotonic() - _t0
 
                 _t0 = time.monotonic()
                 eval_B = [(i, leaves_B[i]) for i in range(len(leaves_B))
-                          if not leaves_B[i].is_terminal and leaves_B[i].deltas]
+                          if leaves_B[i] is not None
+                          and not leaves_B[i].is_terminal
+                          and leaves_B[i].deltas]
                 t_collect += time.monotonic() - _t0
 
                 # -- Sync A, backprop A --
@@ -280,6 +293,13 @@ class SelfPlayManager:
                 self._backprop_group(
                     slots_B, leaves_B, eval_B, batch_B_vals, batch_B_exp, _bp)
                 t_backprop += time.monotonic() - _t0
+
+                # Track per-slot sims and check early termination
+                for s in slots:
+                    if s.sims_done < turn_sims:
+                        s.sims_done += 1
+                if all(s.sims_done >= turn_sims for s in slots):
+                    break
 
             n_turns += 1
 
@@ -376,6 +396,18 @@ class SelfPlayManager:
                         if min_d > 2:
                             far_stones += 1
                     slot.game.make_move(q, r)
+
+                # Save child subtree for tree reuse (pair moves only)
+                if len(moves) == 2:
+                    _s1_idx = moves[0][0] * BOARD_SIZE + moves[0][1]
+                    _s2_idx = moves[1][0] * BOARD_SIZE + moves[1][1]
+                    _children = slot.tree.root_pos.children
+                    slot.reuse_subtree = (
+                        _children.get((_s1_idx, _s2_idx))
+                        if _children else None
+                    )
+                else:
+                    slot.reuse_subtree = None
 
                 slot.turn_number += 1
                 slot.tree = None  # will be re-created next iteration
@@ -511,6 +543,11 @@ class SelfPlayManager:
         trees = create_trees_batched(games, model, device, add_noise=True)
         for i, tree in zip(active, trees):
             slots[i].tree = tree
+            if slots[i].reuse_subtree is not None:
+                grafted = graft_reused_subtree(
+                    tree, slots[i].reuse_subtree, add_noise=True)
+                slots[i].reuse_subtree = None
+                slots[i].sims_done = grafted
 
     def _prepare_delta(self, leaves, trees, eval_buf):
         """Fill eval buffer with root planes + deltas (CPU only)."""
@@ -578,6 +615,8 @@ class SelfPlayManager:
         """Backprop for a group of slots."""
         eval_map = {li: j for j, (li, _) in enumerate(eval_list)}
         for i, leaf in enumerate(leaves):
+            if leaf is None:
+                continue
             j = eval_map.get(i)
             if leaf.is_terminal:
                 _bp(group_slots[i].tree, leaf, 0.0)
