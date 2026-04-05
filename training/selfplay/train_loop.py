@@ -1055,6 +1055,13 @@ def _run_batched_sims(
 ):
     """Run n_sims MCTS simulations for a group of games, batching NN evals."""
     from mcts.tree import select_leaf, expand_and_backprop, maybe_expand_leaf
+    try:
+        from mcts._mcts_cy import select_leaf_cy, backprop_cy
+        _sel = select_leaf_cy
+        _bp = backprop_cy
+    except ImportError:
+        _sel = select_leaf
+        _bp = expand_and_backprop
 
     B = len(indices)
     if B == 0:
@@ -1065,14 +1072,14 @@ def _run_batched_sims(
 
     for _sim in range(n_sims):
         # Select leaves for all games in group
-        leaves = [select_leaf(trees[indices[j]], games[indices[j]])
+        leaves = [_sel(trees[indices[j]], games[indices[j]])
                   for j in range(B)]
 
         # Partition: terminal vs needs-eval
         eval_list = []  # (position_in_group, leaf)
         for j, leaf in enumerate(leaves):
             if leaf.is_terminal or not leaf.deltas:
-                expand_and_backprop(trees[indices[j]], leaf, 0.0)
+                _bp(trees[indices[j]], leaf, 0.0)
             else:
                 eval_list.append((j, leaf))
 
@@ -1121,7 +1128,7 @@ def _run_batched_sims(
         values_cpu = values.cpu()
         for k, (j, leaf) in enumerate(eval_list):
             nn_val = values_cpu[k].item()
-            expand_and_backprop(trees[indices[j]], leaf, nn_val)
+            _bp(trees[indices[j]], leaf, nn_val)
             if k in expand_data:
                 mg, ti, tv = expand_data[k]
                 maybe_expand_leaf(trees[indices[j]], leaf, mg, ti, tv,
@@ -1231,9 +1238,15 @@ def evaluate_vs_anchor(
     pbar.close()
     total = max(wins + losses + draws, 1)
     score = (wins + 0.5 * draws) / total
+
+    # Check game diversity: how many unique final boards?
+    board_hashes = [hash(frozenset(g.board.items())) for g in games]
+    n_unique = len(set(board_hashes))
     print(f"  vs Anchor: {wins}W / {losses}L / {draws}D "
-          f"= {100 * score:.1f}% score")
-    return {"wins": wins, "losses": losses, "draws": draws, "score": score}
+          f"= {100 * score:.1f}% score  ({n_unique}/{n_games} unique games)")
+
+    return {"wins": wins, "losses": losses, "draws": draws, "score": score,
+            "unique_games": n_unique}
 
 
 # ---------------------------------------------------------------------------
@@ -1352,7 +1365,7 @@ def main():
                         help="Learning rate")
     parser.add_argument("--eval-games", type=int, default=256,
                         help="Evaluation games per anchor eval")
-    parser.add_argument("--eval-sims", type=int, default=200,
+    parser.add_argument("--eval-sims", type=int, default=600,
                         help="MCTS sims for evaluation bot")
     parser.add_argument("--minimax-time", type=float, default=0.001,
                         help="Initial center time for crossover estimation")
