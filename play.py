@@ -49,6 +49,13 @@ REVIEW_COLOR = (100, 220, 100)
 
 AI_MOVE_DELAY = 300
 
+# Edit-mode "next turn" button
+NEXT_BTN_W = 130
+NEXT_BTN_H = 34
+NEXT_BTN_X = WINDOW_WIDTH - NEXT_BTN_W - 16
+NEXT_BTN_Y = 16
+NEXT_BTN_RECT = pygame.Rect(NEXT_BTN_X, NEXT_BTN_Y, NEXT_BTN_W, NEXT_BTN_H)
+
 
 def _hex_distance(dq, dr):
     return max(abs(dq), abs(dr), abs(dq + dr))
@@ -157,7 +164,8 @@ def draw_board(screen, game, visible_cells, hover_hex, hex_size, ox, oy, fonts,
                last_ai_moves=(), edit_hover_btn=1,
                show_numbers=False, move_numbers=None,
                save_msg=None, autoplay=False,
-               review_pos=0, review_total=0):
+               review_pos=0, review_total=0,
+               edit_next_player=Player.A):
     font_big, font_med, font_sm = fonts
     screen.fill(BG_COLOR)
 
@@ -284,6 +292,16 @@ def draw_board(screen, game, visible_cells, hover_hex, hex_size, ox, oy, fonts,
         msg_surf = font_med.render(save_msg, True, (100, 255, 100))
         screen.blit(msg_surf, msg_surf.get_rect(centerx=WINDOW_WIDTH // 2, y=WINDOW_HEIGHT - 70))
 
+    # "Next turn" button in edit mode
+    if mode == MODE_EDIT:
+        btn_color = PLAYER_A_COLOR if edit_next_player == Player.A else PLAYER_B_COLOR
+        pygame.draw.rect(screen, btn_color, NEXT_BTN_RECT, border_radius=6)
+        pygame.draw.rect(screen, tuple(min(c + 60, 255) for c in btn_color),
+                         NEXT_BTN_RECT, 2, border_radius=6)
+        label_text = "Next: Red" if edit_next_player == Player.A else "Next: Blue"
+        label = font_sm.render(label_text, True, (255, 255, 255))
+        screen.blit(label, label.get_rect(center=NEXT_BTN_RECT.center))
+
     pygame.display.flip()
 
 
@@ -362,6 +380,7 @@ def main():
     ai_stats = None
     last_ai_moves = ()
     edit_hover_btn = 1
+    edit_next_player = Player.A
     show_numbers = False
     move_numbers = {}
     turn_number = 0
@@ -411,6 +430,12 @@ def main():
                     hover_hex = None
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
+                # "Next turn" toggle in edit mode
+                if (event.button == 1 and mode == MODE_EDIT
+                        and NEXT_BTN_RECT.collidepoint(event.pos)):
+                    edit_next_player = Player.B if edit_next_player == Player.A else Player.A
+                    continue
+
                 if mode == MODE_EDIT:
                     q, r = pixel_to_hex(*event.pos, hex_size, ox, oy)
                     if args.torus:
@@ -512,14 +537,15 @@ def main():
 
                 elif event.key == pygame.K_e:
                     if mode == MODE_EDIT:
-                        game.current_player = Player.A
+                        game.current_player = edit_next_player
                         game.moves_left_in_turn = 1 if not game.board else 2
                         game.move_count = len(game.board)
                         game.winner = Player.NONE
                         if hasattr(game, 'winning_cells'):
                             game.winning_cells = []
                         game.game_over = False
-                        human_player = Player.B
+                        other = Player.B if edit_next_player == Player.A else Player.A
+                        human_player = other
                         last_ai_time = now
                         ai_stats = None
                         last_ai_moves = ()
@@ -528,7 +554,7 @@ def main():
                         move_history = []
                         history_pos = 0
                         base_board = dict(game.board)
-                        base_player = Player.A
+                        base_player = edit_next_player
                         mode = MODE_PLAY
                     else:
                         mode = MODE_EDIT
@@ -576,7 +602,8 @@ def main():
                    last_ai_moves=last_ai_moves, edit_hover_btn=edit_hover_btn,
                    show_numbers=show_numbers, move_numbers=move_numbers,
                    save_msg=save_msg, autoplay=autoplay,
-                   review_pos=history_pos, review_total=len(move_history))
+                   review_pos=history_pos, review_total=len(move_history),
+                   edit_next_player=edit_next_player)
         clock.tick(60)
 
 
