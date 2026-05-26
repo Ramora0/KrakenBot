@@ -158,6 +158,7 @@ class SelfPlayManager:
         draws = 0
         total_positions = 0
         total_moves_in_completed = 0
+        game_lengths = []
         far_stones = 0      # stones placed > dist 2 from any existing stone
         total_stones = 0    # all stones placed (excl. first center stone)
         n_full_turns = 0
@@ -455,6 +456,7 @@ class SelfPlayManager:
                     games_completed += 1
                     pbar.update(1)
                     total_moves_in_completed += slot.game.move_count
+                    game_lengths.append(slot.game.move_count)
                     n = wins_a + wins_b + draws
                     avg_moves = total_moves_in_completed / max(n, 1)
                     pbar.set_postfix(
@@ -515,7 +517,7 @@ class SelfPlayManager:
         print(f"  Full-search turns: {n_full_turns}/{n_full_turns + n_quick_turns} "
               f"({100 * full_search_pct:.1f}%)")
         return all_examples, draw_rate, a_win_rate, avg_moves, far_pct, \
-            full_search_pct
+            full_search_pct, game_lengths
 
     def _new_slot(self, game_id: int) -> SelfPlaySlot:
         """Create a new game slot on a toroidal board. First move at center."""

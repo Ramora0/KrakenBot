@@ -1034,6 +1034,7 @@ class ParallelSelfPlayPool:
         games_completed = 0
         wins_a = wins_b = draws = 0
         total_moves = 0
+        game_lengths = []
         far_stones = 0
         total_stones = 0
         n_full_turns = 0
@@ -1162,6 +1163,7 @@ class ParallelSelfPlayPool:
                             draws += 1
                         games_completed += 1
                         total_moves += c['move_count']
+                        game_lengths.append(c['move_count'])
                         pbar.update(1)
                         n = wins_a + wins_b + draws
                         pbar.set_postfix(
@@ -1251,7 +1253,7 @@ class ParallelSelfPlayPool:
         print(f"  Full-search turns: {n_full_turns}/{n_full_turns + n_quick_turns} "
               f"({100 * full_search_pct:.1f}%)")
         return all_examples, draw_rate, a_win_rate, avg_moves, far_pct, \
-            full_search_pct
+            full_search_pct, game_lengths
 
     def evaluate(self, models, device, n_games=256, n_sims=200,
                  temperature=0.1):

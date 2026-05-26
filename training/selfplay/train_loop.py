@@ -1644,7 +1644,7 @@ def main():
                     and start_round == 0
                 ) else COMPLETED_PER_ROUND
                 examples, draw_rate, a_win_rate, avg_moves, far_pct, \
-                    full_search_pct = pool.generate_round(
+                    full_search_pct, game_lengths = pool.generate_round(
                         model, device,
                         round_id=round_num,
                         data_dir=args.data_dir,
@@ -1670,7 +1670,7 @@ def main():
                     draw_penalty=args.draw_penalty,
                 )
                 examples, draw_rate, a_win_rate, avg_moves, far_pct, \
-                    full_search_pct = manager.generate(
+                    full_search_pct, game_lengths = manager.generate(
                         round_num, force_warm=start_round > 0)
                 manager.save_round(examples, round_num, args.data_dir)
 
@@ -1805,6 +1805,31 @@ def main():
             print(f"    Time: {t_gen:.0f}s gen + {t_train:.0f}s train "
                   f"+ {t_eval:.0f}s eval = {t_total:.0f}s total")
 
+            # --- Game-length distribution (truncation diagnostic) ---
+            from training.selfplay.self_play import MAX_GAME_MOVES
+            length_stats = {}
+            if game_lengths:
+                _gl = np.asarray(game_lengths)
+                _pcts = np.percentile(_gl, [10, 25, 50, 75, 90, 95, 99])
+                pct_at_cap = float(np.mean(_gl >= MAX_GAME_MOVES))
+                length_stats = {
+                    "len/mean": float(_gl.mean()),
+                    "len/std": float(_gl.std()),
+                    "len/min": int(_gl.min()),
+                    "len/p10": float(_pcts[0]),
+                    "len/p25": float(_pcts[1]),
+                    "len/p50": float(_pcts[2]),
+                    "len/p75": float(_pcts[3]),
+                    "len/p90": float(_pcts[4]),
+                    "len/p95": float(_pcts[5]),
+                    "len/p99": float(_pcts[6]),
+                    "len/max": int(_gl.max()),
+                    "len/pct_at_cap": pct_at_cap,
+                }
+                print(f"    Game length: median {_pcts[2]:.0f}, p90 {_pcts[4]:.0f}, "
+                      f"p99 {_pcts[6]:.0f}, max {int(_gl.max())} | "
+                      f"{100 * pct_at_cap:.1f}% at cap ({MAX_GAME_MOVES})")
+
             if use_wandb:
                 log_data = {
                     "round": round_num,
@@ -1838,6 +1863,14 @@ def main():
                     log_data["eval/wins"] = eval_result["wins"]
                     log_data["eval/losses"] = eval_result["losses"]
                     log_data["eval/draws"] = eval_result["draws"]
+                log_data.update(length_stats)
+                if game_lengths:
+                    log_data["len/hist"] = wandb.Histogram(
+                        game_lengths, num_bins=64)
+                    _decisive = [L for L in game_lengths if L < MAX_GAME_MOVES]
+                    if _decisive:
+                        log_data["len/hist_decisive"] = wandb.Histogram(
+                            _decisive, num_bins=64)
                 wandb.log(log_data)
 
             round_num += 1
