@@ -12,10 +12,12 @@ Architecture:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import queue
 import random
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -31,9 +33,16 @@ from mcts.tree import (
     N_CELLS, select_leaf,
     expand_and_backprop, maybe_expand_leaf, get_pair_visits, get_single_visits,
     select_move_pair, select_single_move, _build_tree_from_eval,
-    _hex_dist_torus,
+    _hex_dist_torus, apply_virtual_loss, remove_virtual_loss,
 )
 from model.resnet import BOARD_SIZE
+
+# Depth-2 pipeline overlap: signal the main to start forward(sim+1) right after
+# select (barrier B1), so the GPU forward overlaps the workers' backprop of sim.
+# Set KRAKEN_DEPTH2=0 to defer the signal to after backprop (barrier B2) -- the
+# pre-overlap behavior -- for A/B measurement. Evaluated per process at import
+# (spawn workers inherit the env).
+_DEPTH2_OVERLAP = os.environ.get("KRAKEN_DEPTH2", "1") != "0"
 
 try:
     from mcts._mcts_cy import CyGameState, select_leaf_cy, backprop_cy
@@ -73,15 +82,26 @@ class SharedBuffers:
             for _ in range(2)
         ]
 
-        # GPU results (main writes, workers read)
-        self.values = torch.zeros(batch_size, dtype=torch.float32).share_memory_()
-        self.has_expand = torch.zeros(batch_size, dtype=torch.bool).share_memory_()
-        self.marginals = torch.zeros(batch_size, N_CELLS,
-                                     dtype=torch.float32).share_memory_()
-        self.top_indices = torch.zeros(batch_size, 200,
-                                       dtype=torch.int64).share_memory_()
-        self.top_values = torch.zeros(batch_size, 200,
-                                      dtype=torch.float32).share_memory_()
+        # GPU results (main writes, workers read) -- double-buffered [buf], like
+        # the delta buffers above. The main writes forward(K)'s results into
+        # buffer K%2 and signals; workers read from K%2 while the main is free
+        # to run forward(K+1) into (K+1)%2. This is what lets the GPU forward
+        # overlap the workers' backprop (depth-2 pipeline).
+        self.values = [
+            torch.zeros(batch_size, dtype=torch.float32).share_memory_()
+            for _ in range(2)]
+        self.has_expand = [
+            torch.zeros(batch_size, dtype=torch.bool).share_memory_()
+            for _ in range(2)]
+        self.marginals = [
+            torch.zeros(batch_size, N_CELLS, dtype=torch.float32).share_memory_()
+            for _ in range(2)]
+        self.top_indices = [
+            torch.zeros(batch_size, 200, dtype=torch.int64).share_memory_()
+            for _ in range(2)]
+        self.top_values = [
+            torch.zeros(batch_size, 200, dtype=torch.float32).share_memory_()
+            for _ in range(2)]
 
         # Tree creation buffers (workers write planes, main writes NN results)
         self.tree_planes = torch.zeros(
@@ -112,16 +132,21 @@ class SharedBuffers:
         self.n_workers = 0  # set later
 
 
-def _create_sync(n_workers):
-    """Create synchronization primitives. Must be called before spawn."""
+def _create_sync(n_workers, ctx):
+    """Create synchronization primitives.
+
+    Must be created from the same (spawn) context as the worker processes:
+    primitives from a different context aren't actually shared across the
+    process boundary, which silently breaks the barriers/events.
+    """
     return {
-        'worker_barrier': mp.Barrier(n_workers),
-        'deltas_ready': [mp.Event() for _ in range(2)],
-        'results_ready': mp.Event(),
-        'error': mp.Value('i', 0),  # error flag
-        'stop': mp.Value('i', 0),   # set to 1 when main wants workers to exit
-        'tree_request_ready': mp.Event(),   # workers -> main: tree planes written
-        'tree_results_ready': mp.Event(),   # main -> workers: tree NN results ready
+        'worker_barrier': ctx.Barrier(n_workers),
+        'deltas_ready': [ctx.Event() for _ in range(2)],
+        'results_ready': [ctx.Event() for _ in range(2)],
+        'error': ctx.Value('i', 0),  # error flag
+        'stop': ctx.Value('i', 0),   # set to 1 when main wants workers to exit
+        'tree_request_ready': ctx.Event(),   # workers -> main: tree planes written
+        'tree_results_ready': ctx.Event(),   # main -> workers: tree NN results ready
     }
 
 
@@ -285,9 +310,12 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                         _write_delta(shared_bufs, next_leaves[i], slot.tree,
                                      my_start + i, buf_next)
 
-                # Wait for GPU results for current sim
+                # Wait for GPU results for current sim.
+                # NOTE: this legacy generate_parallel path is unused (kept for
+                # reference). It stays single-buffered: results always live in
+                # slot [0] of the now-double-buffered result buffers.
                 if not _wait_event_worker(
-                        results_ready, stop_flag, None,
+                        results_ready[0], stop_flag, None,
                         label=f"w{worker_id}:results sim={sim}"):
                     break
 
@@ -297,14 +325,14 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                     if not shared_bufs.needs_eval[buf_cur][gi]:
                         _bp(slot.tree, leaves[i], 0.0)
                     else:
-                        nn_val = shared_bufs.values[gi].item()
+                        nn_val = shared_bufs.values[0][gi].item()
                         _bp(slot.tree, leaves[i], nn_val)
-                        if shared_bufs.has_expand[gi]:
+                        if shared_bufs.has_expand[0][gi]:
                             maybe_expand_leaf(
                                 slot.tree, leaves[i],
-                                shared_bufs.marginals[gi],
-                                shared_bufs.top_indices[gi],
-                                shared_bufs.top_values[gi],
+                                shared_bufs.marginals[0][gi],
+                                shared_bufs.top_indices[0][gi],
+                                shared_bufs.top_values[0][gi],
                                 nn_value=nn_val)
 
                 leaves = next_leaves
@@ -312,7 +340,7 @@ def _worker_loop(worker_id, n_workers, batch_size, n_sims,
                 # Sync: all workers done with backprop + next select
                 wb.wait()
                 if worker_id == 0:
-                    results_ready.clear()
+                    results_ready[0].clear()
                     if sim < n_sims - 1:
                         deltas_ready[buf_next].set()
         except BrokenBarrierError:
@@ -500,16 +528,25 @@ def _serialize_slot(slot):
 
 @torch.no_grad()
 def _gpu_forward(models, device, delta_buf, needs_eval, needs_expand_flag,
-                 shared):
-    """Run GPU forward on the delta buffer, write results to shared.
+                 shared, buf):
+    """Run GPU forward on the delta buffer, write results to shared[buf].
 
     Args:
         models: single model or list/tuple of models.
             When multiple models are given, shared.model_id routes each
             slot to the correct model.
+        buf: result double-buffer index (0/1) to write into. Must match the
+            delta buffer the workers wrote and the results_ready[buf] they wait
+            on, so forward(K) results land where backprop(K) reads them.
     """
     if not isinstance(models, (list, tuple)):
         models = [models]
+
+    values_out = shared.values[buf]
+    has_expand_out = shared.has_expand[buf]
+    marginals_out = shared.marginals[buf]
+    top_indices_out = shared.top_indices[buf]
+    top_values_out = shared.top_values[buf]
 
     indices = needs_eval.nonzero(as_tuple=True)[0]
     B = len(indices)
@@ -541,10 +578,10 @@ def _gpu_forward(models, device, delta_buf, needs_eval, needs_expand_flag,
     # Write values (bulk copy, no Python loop)
     vals_cpu = values.cpu()
     idx_list = indices.tolist()
-    shared.values[indices] = vals_cpu.float()
+    values_out[indices] = vals_cpu.float()
 
     # Only compute expand data for leaves that need it
-    shared.has_expand.fill_(False)
+    has_expand_out.fill_(False)
 
     # Map eval-batch indices to global indices for expansion
     expand_global = []
@@ -568,10 +605,10 @@ def _gpu_forward(models, device, delta_buf, needs_eval, needs_expand_flag,
         top_vals_cpu = top_vals.cpu()
 
         for j, gi in enumerate(expand_global):
-            shared.has_expand[gi] = True
-            shared.marginals[gi] = margs_cpu[j]
-            shared.top_indices[gi] = top_idx_cpu[j]
-            shared.top_values[gi] = top_vals_cpu[j]
+            has_expand_out[gi] = True
+            marginals_out[gi] = margs_cpu[j]
+            top_indices_out[gi] = top_idx_cpu[j]
+            top_values_out[gi] = top_vals_cpu[j]
 
     del pair_logits
 
@@ -657,21 +694,21 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
     if is_cold_start:
         print(f"Cold start: targeting {target} games")
 
+    # Explicit spawn context: forking after CUDA + torch's worker threads
+    # are initialised deadlocks workers on locks inherited in a bad state.
+    ctx = mp.get_context('spawn')
+
     # Create shared buffers
     shared = SharedBuffers(batch_size, model_dtype)
-    sync = _create_sync(n_workers)
+    sync = _create_sync(n_workers, ctx)
 
     # Result collection
-    result_queue = mp.Queue()
+    result_queue = ctx.Queue()
 
     # Spawn workers
-    try:
-        mp.set_start_method('spawn')
-    except RuntimeError:
-        pass  # already set
     workers = []
     for wid in range(n_workers):
-        p = mp.Process(
+        p = ctx.Process(
             target=_worker_fn,
             args=(wid, n_workers, batch_size, n_sims,
                   game_dicts, next_game_id,
@@ -735,17 +772,17 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
                     _drain_errors(result_queue)
                     raise RuntimeError("Worker process failed")
 
-                # GPU forward
+                # GPU forward (legacy path: single-buffered results in slot [0])
                 _t0 = time.monotonic()
                 _gpu_forward(model, device,
                              shared.delta[buf_idx],
                              shared.needs_eval[buf_idx],
                              shared.needs_expand_flag[buf_idx],
-                             shared)
+                             shared, 0)
                 t_gpu += time.monotonic() - _t0
 
                 # Signal workers: results ready
-                sync['results_ready'].set()
+                sync['results_ready'][0].set()
 
             n_turns += 1
 
@@ -829,7 +866,8 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
     finally:
         # Signal workers to stop and break any barrier deadlocks
         sync['stop'].value = 1
-        sync['results_ready'].set()
+        for ev in sync['results_ready']:
+            ev.set()
         sync['tree_results_ready'].set()
         for ev in sync['deltas_ready']:
             ev.set()
@@ -845,7 +883,8 @@ def generate_parallel(model, device, batch_size, n_sims, round_id, data_dir,
         pbar.close()
 
     # Save pending games
-    _save_pending(pending_slots, next_game_id + games_completed * 2, data_dir)
+    _save_pending(pending_slots, next_game_id + games_completed * 2,
+                  os.path.join(data_dir, "pending.json"))
 
     total_games = wins_a + wins_b + draws
     draw_rate = draws / max(total_games, 1)
@@ -916,15 +955,14 @@ def _wait_event_worker(event, stop_flag, round_stop, label="event",
     return True
 
 
-def _save_pending(slots_data, next_game_id, data_dir):
-    """Save pending games for next round."""
+def _save_pending(slots_data, next_game_id, path):
+    """Save pending games for next round. `path` is the full file path."""
     data = {"games": slots_data, "next_game_id": next_game_id}
-    path = os.path.join(data_dir, "pending.json")
     tmp = path + ".tmp"
     with open(tmp, 'w') as f:
         json.dump(data, f)
     os.replace(tmp, path)
-    print(f"Saved {len(slots_data)} in-progress games")
+    print(f"Saved {len(slots_data)} in-progress games -> {os.path.basename(path)}")
 
 
 # ---------------------------------------------------------------------------
@@ -947,6 +985,14 @@ class ParallelSelfPlayPool:
         self.full_search_prob = full_search_prob
         self.n_workers = n_workers
 
+        # Explicit spawn context. The default start method on Linux is fork,
+        # and forking after the main process has initialised CUDA and torch's
+        # worker threads leaves the child with locks held by threads that no
+        # longer exist -> the worker's first tensor op deadlocks. Spawn starts
+        # clean workers; torch.multiprocessing handles shared-tensor passing.
+        # All primitives shared with workers MUST come from this same context.
+        self.ctx = mp.get_context('spawn')
+
         # Shared memory (allocated once, reused across rounds)
         self.shared = SharedBuffers(batch_size, model_dtype)
         self.sync = None
@@ -955,34 +1001,33 @@ class ParallelSelfPlayPool:
         self._alive = False
 
         # Round control (shared values readable by workers)
-        self._round_id = mp.Value('i', -1)
-        self._late_temperature = mp.Value('f', 0.3)
-        self._draw_penalty = mp.Value('f', 0.1)
-        self._round_stop = mp.Value('i', 0)
-        self._new_round = mp.Event()
+        self._round_id = self.ctx.Value('i', -1)
+        self._late_temperature = self.ctx.Value('f', 0.3)
+        self._draw_penalty = self.ctx.Value('f', 0.1)
+        self._round_stop = self.ctx.Value('i', 0)
+        self._new_round = self.ctx.Event()
         # Barrier for workers + main to sync at round end
-        self._round_end_barrier = mp.Barrier(n_workers + 1)
-        self._next_game_id = mp.Value('i', 0)
+        self._round_end_barrier = self.ctx.Barrier(n_workers + 1)
+        self._next_game_id = self.ctx.Value('i', 0)
         # Eval mode flags (shared with workers)
-        self._eval_mode = mp.Value('i', 0)    # 1 = eval mode (no replace, no noise)
-        self._eval_temperature = mp.Value('f', 0.1)
+        self._eval_mode = self.ctx.Value('i', 0)  # 1 = eval (no replace, no noise)
+        self._eval_temperature = self.ctx.Value('f', 0.1)
         # Playout cap randomization (main writes, workers read per turn)
-        self._turn_n_sims = mp.Value('i', n_sims)
-        self._is_full_search = mp.Value('i', 0)
+        self._turn_n_sims = self.ctx.Value('i', n_sims)
+        self._is_full_search = self.ctx.Value('i', 0)
+        self.last_round_turns = 0  # turns run in the last generate_round
+        # Raw counts from the last generate_round, for aggregation by a
+        # multi-GPU coordinator (see MultiGPUSelfPlayPool).
+        self.last_round_stats = {}
 
     def start(self, game_dicts, next_game_id):
         """Spawn workers with initial game data. Call once."""
         self._next_game_id.value = next_game_id
-        self.sync = _create_sync(self.n_workers)
-        self.result_queue = mp.Queue()
-
-        try:
-            mp.set_start_method('spawn')
-        except RuntimeError:
-            pass
+        self.sync = _create_sync(self.n_workers, self.ctx)
+        self.result_queue = self.ctx.Queue()
 
         for wid in range(self.n_workers):
-            p = mp.Process(
+            p = self.ctx.Process(
                 target=_pool_worker_fn,
                 args=(wid, self.n_workers, self.batch_size, self.n_sims,
                       game_dicts, next_game_id,
@@ -1002,8 +1047,20 @@ class ParallelSelfPlayPool:
 
     def generate_round(self, model, device, round_id, data_dir,
                        late_temperature=0.3, draw_penalty=0.1,
-                       target=None, viewer=None):
-        """Run one round of self-play. Returns (examples, draw_rate)."""
+                       target=None, viewer=None, max_seconds=None,
+                       pending_path=None, bar_position=0, bar_desc=None,
+                       show_pos_bar=True, verbose=True):
+        """Run one round of self-play. Returns (examples, draw_rate).
+
+        If max_seconds is set, the round stops after that wall-clock time
+        (checked between turns) regardless of games completed -- used by the
+        sustained-throughput speed test (tools.speed_test).
+
+        pending_path/bar_position/bar_desc/show_pos_bar/verbose let a
+        multi-GPU coordinator drive several pools concurrently in threads
+        without their progress bars, timing prints, or pending files
+        colliding. Defaults reproduce the original single-GPU behavior.
+        """
         if not self._alive:
             raise RuntimeError("Pool not started")
 
@@ -1040,8 +1097,10 @@ class ParallelSelfPlayPool:
         n_full_turns = 0
         n_quick_turns = 0
 
-        pbar = tqdm(total=target, desc="Games", unit="game", position=0)
-        pos_bar = tqdm(desc="Positions", unit="pos", position=1)
+        pbar = tqdm(total=target, desc=(bar_desc or "Games"), unit="game",
+                    position=bar_position)
+        pos_bar = (tqdm(desc="Positions", unit="pos", position=bar_position + 1)
+                   if show_pos_bar else None)
 
         t_wait = 0.0
         t_gpu = 0.0
@@ -1050,8 +1109,12 @@ class ParallelSelfPlayPool:
         n_turns = 0
         pending_slots = []
 
+        _round_t0 = time.monotonic()
         try:
             while games_completed < target:
+                if max_seconds is not None and \
+                        time.monotonic() - _round_t0 >= max_seconds:
+                    break
                 # === Tree creation phase ===
                 _t0 = time.monotonic()
                 _wait_event_main(sync['tree_request_ready'], self.workers,
@@ -1099,14 +1162,14 @@ class ParallelSelfPlayPool:
                                  shared.delta[buf_idx],
                                  shared.needs_eval[buf_idx],
                                  shared.needs_expand_flag[buf_idx],
-                                 shared)
+                                 shared, buf_idx)
                     t_gpu += time.monotonic() - _t0
 
-                    sync['results_ready'].set()
+                    sync['results_ready'][buf_idx].set()
 
                 n_turns += 1
 
-                if n_turns % 5 == 0:
+                if verbose and n_turns % 5 == 0:
                     t_tot = t_wait + t_gpu + t_tree_gpu + t_collect
                     if t_tot > 0:
                         pbar.write(
@@ -1120,7 +1183,8 @@ class ParallelSelfPlayPool:
 
                 # === Collect results ===
                 _t0 = time.monotonic()
-                pos_bar.update(batch_size)
+                if pos_bar is not None:
+                    pos_bar.update(batch_size)
                 pending_slots = []
                 for _ in range(n_workers):
                     # Poll with short timeout so we can check worker health
@@ -1197,7 +1261,7 @@ class ParallelSelfPlayPool:
             raise
         else:
             t_tot = t_wait + t_gpu + t_tree_gpu + t_collect
-            if t_tot > 0 and n_turns > 0:
+            if verbose and t_tot > 0 and n_turns > 0:
                 print(f"\n  Timing ({n_turns} turns, {t_tot:.1f}s):")
                 for label, t in [("wait_cpu", t_wait), ("gpu_fwd", t_gpu),
                                  ("tree_gpu", t_tree_gpu),
@@ -1207,11 +1271,22 @@ class ParallelSelfPlayPool:
                 print(f"    {'total':>10s}: {t_tot:6.1f}s  "
                       f"{n_turns/t_tot:.1f} turns/s")
         finally:
+            # Expose turn count for throughput measurement (tools.speed_test).
+            self.last_round_turns = n_turns
+            # Raw counts for a multi-GPU coordinator to aggregate exactly.
+            self.last_round_stats = {
+                'wins_a': wins_a, 'wins_b': wins_b, 'draws': draws,
+                'total_moves': total_moves, 'far_stones': far_stones,
+                'total_stones': total_stones,
+                'n_full_turns': n_full_turns, 'n_quick_turns': n_quick_turns,
+                'games_completed': games_completed,
+            }
             # Signal workers to stop the current round (not permanently)
             self._round_stop.value = 1
             self._new_round.clear()
             # Unblock workers waiting on any event
-            sync['results_ready'].set()
+            for ev in sync['results_ready']:
+                ev.set()
             sync['tree_results_ready'].set()
             for ev in sync['deltas_ready']:
                 ev.set()
@@ -1231,17 +1306,20 @@ class ParallelSelfPlayPool:
             except Exception:
                 pass
             # Reset sync state for next round
-            sync['results_ready'].clear()
+            for ev in sync['results_ready']:
+                ev.clear()
             sync['tree_results_ready'].clear()
             for ev in sync['deltas_ready']:
                 ev.clear()
             sync['tree_request_ready'].clear()
-            pos_bar.close()
+            if pos_bar is not None:
+                pos_bar.close()
             pbar.close()
 
         # Save pending games for crash recovery
-        _save_pending(pending_slots,
-                      self._next_game_id.value, data_dir)
+        if pending_path is None:
+            pending_path = os.path.join(data_dir, "pending.json")
+        _save_pending(pending_slots, self._next_game_id.value, pending_path)
 
         total_games = wins_a + wins_b + draws
         draw_rate = draws / max(total_games, 1)
@@ -1250,8 +1328,10 @@ class ParallelSelfPlayPool:
         avg_moves = total_moves / max(total_games, 1)
         far_pct = 100 * far_stones / max(total_stones, 1)
         full_search_pct = n_full_turns / max(n_full_turns + n_quick_turns, 1)
-        print(f"  Full-search turns: {n_full_turns}/{n_full_turns + n_quick_turns} "
-              f"({100 * full_search_pct:.1f}%)")
+        if verbose:
+            print(f"  Full-search turns: "
+                  f"{n_full_turns}/{n_full_turns + n_quick_turns} "
+                  f"({100 * full_search_pct:.1f}%)")
         return all_examples, draw_rate, a_win_rate, avg_moves, far_pct, \
             full_search_pct, game_lengths
 
@@ -1377,10 +1457,10 @@ class ParallelSelfPlayPool:
                                  shared.delta[buf_idx],
                                  shared.needs_eval[buf_idx],
                                  shared.needs_expand_flag[buf_idx],
-                                 shared)
+                                 shared, buf_idx)
                     t_gpu += time.monotonic() - _t0
 
-                    sync['results_ready'].set()
+                    sync['results_ready'][buf_idx].set()
 
                 n_turns += 1
                 if n_turns % 10 == 0:
@@ -1444,7 +1524,8 @@ class ParallelSelfPlayPool:
             # Signal workers to stop the eval round
             self._round_stop.value = 1
             self._new_round.clear()
-            sync['results_ready'].set()
+            for ev in sync['results_ready']:
+                ev.set()
             sync['tree_results_ready'].set()
             for ev in sync['deltas_ready']:
                 ev.set()
@@ -1460,7 +1541,8 @@ class ParallelSelfPlayPool:
                 sync['worker_barrier'].reset()
             except Exception:
                 pass
-            sync['results_ready'].clear()
+            for ev in sync['results_ready']:
+                ev.clear()
             sync['tree_results_ready'].clear()
             for ev in sync['deltas_ready']:
                 ev.clear()
@@ -1498,7 +1580,8 @@ class ParallelSelfPlayPool:
         self.sync['stop'].value = 1
         self._round_stop.value = 1
         self._new_round.set()
-        self.sync['results_ready'].set()
+        for ev in self.sync['results_ready']:
+            ev.set()
         self.sync['tree_results_ready'].set()
         for ev in self.sync['deltas_ready']:
             ev.set()
@@ -1516,6 +1599,233 @@ class ParallelSelfPlayPool:
                 p.terminate()
         self.workers.clear()
         self._alive = False
+
+
+# ---------------------------------------------------------------------------
+# Multi-GPU coordinator
+# ---------------------------------------------------------------------------
+
+def _even_split(total, n):
+    """Split `total` into `n` near-equal integer parts (first parts larger)."""
+    base, rem = divmod(total, n)
+    return [base + (1 if i < rem else 0) for i in range(n)]
+
+
+class MultiGPUSelfPlayPool:
+    """Shard self-play *generation* across multiple GPUs.
+
+    Owns one ``ParallelSelfPlayPool`` plus one inference model replica per GPU.
+    Each sub-pool has its own CPU worker processes and shared-memory buffers,
+    so the sub-pools are completely independent. A round runs every sub-pool
+    concurrently with one orchestrator thread per GPU -- CUDA calls release the
+    GIL, so the GPUs overlap -- and the examples/statistics are aggregated and
+    returned in exactly the shape ``ParallelSelfPlayPool.generate_round``
+    produces, so the training loop is unchanged.
+
+    The global batch and the CPU worker budget are split across the GPUs, and
+    each sub-pool gets a disjoint game-id range and its own ``pending_gpuN.json``
+    crash-recovery file. Evaluation and training stay single-GPU (handled in
+    the training loop), matching the requested scope.
+    """
+
+    # Disjoint game-id base per GPU so ids never collide across sub-pools.
+    _GAME_ID_STRIDE = 100_000_000
+
+    def __init__(self, devices, batch_size, n_sims, n_workers,
+                 model_dtype=torch.float32, n_sims_full=600,
+                 full_search_prob=0.25):
+        self.devices = [torch.device(d) for d in devices]
+        self.n_gpus = len(self.devices)
+        if self.n_gpus < 1:
+            raise ValueError("MultiGPUSelfPlayPool needs at least one device")
+        self.batch_size = batch_size
+        self.model_dtype = model_dtype
+
+        # Split the global batch and CPU workers across GPUs.
+        self._batch_split = _even_split(batch_size, self.n_gpus)
+        if min(self._batch_split) < 1:
+            raise ValueError(
+                f"batch_size {batch_size} too small for {self.n_gpus} GPUs")
+        self._worker_split = [max(1, w) for w in
+                              _even_split(max(n_workers, self.n_gpus),
+                                          self.n_gpus)]
+
+        self.pools = [
+            ParallelSelfPlayPool(
+                self._batch_split[i], n_sims, self._worker_split[i],
+                model_dtype=model_dtype, n_sims_full=n_sims_full,
+                full_search_prob=full_search_prob)
+            for i in range(self.n_gpus)
+        ]
+
+        self._replicas = [None] * self.n_gpus  # per-device inference models
+        self.last_round_turns = 0
+        self.is_cold_start = True
+        self._alive = False
+
+    # ---- lifecycle --------------------------------------------------------
+
+    def start(self, data_dir):
+        """Load/partition pending games and start every sub-pool."""
+        game_dicts_list, next_ids = self._load_pending(data_dir)
+        for i, pool in enumerate(self.pools):
+            print(f"  GPU{i} ({self.devices[i]}): batch={self._batch_split[i]}, "
+                  f"workers={self._worker_split[i]}")
+            pool.start(game_dicts_list[i], next_ids[i])
+        self._alive = True
+
+    def shutdown(self):
+        for pool in self.pools:
+            pool.shutdown()
+        self._alive = False
+
+    # ---- pending-game partitioning ---------------------------------------
+
+    def _load_pending(self, data_dir):
+        """Return (per-GPU game_dicts, per-GPU next_game_id).
+
+        Reads per-GPU ``pending_gpuN.json`` files when present. Falls back to
+        a one-time migration that round-robins a legacy single ``pending.json``
+        across the GPUs, else cold-starts with disjoint id ranges.
+        """
+        per_gpu_paths = [os.path.join(data_dir, f"pending_gpu{i}.json")
+                         for i in range(self.n_gpus)]
+        have_pergpu = any(os.path.exists(p) for p in per_gpu_paths)
+
+        legacy_games = None
+        legacy_path = os.path.join(data_dir, "pending.json")
+        if not have_pergpu and os.path.exists(legacy_path):
+            with open(legacy_path) as f:
+                legacy_games = json.load(f).get("games", [])
+            print(f"Migrating {len(legacy_games)} pending games from "
+                  f"pending.json across {self.n_gpus} GPUs")
+
+        self.is_cold_start = not have_pergpu and not legacy_games
+
+        game_dicts_list, next_ids = [], []
+        for i in range(self.n_gpus):
+            bi = self._batch_split[i]
+            base = (i + 1) * self._GAME_ID_STRIDE
+            gd = [None] * bi
+            nid = base
+            if os.path.exists(per_gpu_paths[i]):
+                with open(per_gpu_paths[i]) as f:
+                    pd = json.load(f)
+                games = pd.get("games", [])
+                for j, item in enumerate(games[:bi]):
+                    gd[j] = item
+                nid = pd.get("next_game_id", base)
+                print(f"  GPU{i}: resumed {min(len(games), bi)} games")
+            elif legacy_games is not None:
+                for j, item in enumerate(legacy_games[i::self.n_gpus][:bi]):
+                    gd[j] = item
+            game_dicts_list.append(gd)
+            next_ids.append(nid)
+        return game_dicts_list, next_ids
+
+    # ---- model replication ------------------------------------------------
+
+    def _refresh_replicas(self, model):
+        """Sync the per-GPU inference replicas to the current model weights."""
+        src_state = model.state_dict()
+        for i, dev in enumerate(self.devices):
+            rep = self._replicas[i]
+            if rep is None:
+                rep = copy.deepcopy(model).to(dev)
+            else:
+                rep.load_state_dict(src_state)
+                rep.to(dev, self.model_dtype)
+            rep.eval()
+            self._replicas[i] = rep
+
+    # ---- generation -------------------------------------------------------
+
+    def generate_round(self, model, device, round_id, data_dir,
+                       late_temperature=0.3, draw_penalty=0.1,
+                       target=None, viewer=None, max_seconds=None):
+        """Run one round across all GPUs. Same return shape as the sub-pool."""
+        if not self._alive:
+            raise RuntimeError("Pool not started")
+        if target is None:
+            target = COMPLETED_PER_ROUND
+
+        self._refresh_replicas(model)
+        targets = _even_split(target, self.n_gpus)
+
+        results = [None] * self.n_gpus
+        errors = [None] * self.n_gpus
+
+        def _run(i):
+            try:
+                torch.cuda.set_device(self.devices[i])
+                results[i] = self.pools[i].generate_round(
+                    self._replicas[i], self.devices[i],
+                    round_id=round_id, data_dir=data_dir,
+                    late_temperature=late_temperature,
+                    draw_penalty=draw_penalty,
+                    target=targets[i], max_seconds=max_seconds,
+                    # Stream only one GPU's games to the viewer (it isn't
+                    # built for concurrent writers).
+                    viewer=(viewer if i == 0 else None),
+                    pending_path=os.path.join(
+                        data_dir, f"pending_gpu{i}.json"),
+                    bar_position=i, bar_desc=f"GPU{i}",
+                    show_pos_bar=False, verbose=False)
+            except Exception:
+                errors[i] = traceback.format_exc()
+
+        threads = [threading.Thread(target=_run, args=(i,), name=f"gen-gpu{i}")
+                   for i in range(self.n_gpus)]
+        t0 = time.monotonic()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        wall = time.monotonic() - t0
+
+        failed = [i for i, e in enumerate(errors) if e is not None]
+        if failed:
+            detail = "\n\n".join(f"GPU{i} failed:\n{errors[i]}" for i in failed)
+            raise RuntimeError(f"Multi-GPU self-play failed:\n{detail}")
+
+        return self._aggregate(results, wall)
+
+    def _aggregate(self, results, wall):
+        all_examples, all_lengths = [], []
+        agg = {k: 0 for k in ('wins_a', 'wins_b', 'draws', 'total_moves',
+                              'far_stones', 'total_stones',
+                              'n_full_turns', 'n_quick_turns')}
+        total_turns = 0
+        pos_played = 0
+        for i, res in enumerate(results):
+            examples, _dr, _aw, _am, _far, _fs, lengths = res
+            all_examples.extend(examples)
+            all_lengths.extend(lengths)
+            st = self.pools[i].last_round_stats
+            for k in agg:
+                agg[k] += st.get(k, 0)
+            turns_i = self.pools[i].last_round_turns
+            total_turns += turns_i
+            pos_played += turns_i * self._batch_split[i]
+        self.last_round_turns = total_turns
+
+        total_games = agg['wins_a'] + agg['wins_b'] + agg['draws']
+        decisive = agg['wins_a'] + agg['wins_b']
+        draw_rate = agg['draws'] / max(total_games, 1)
+        a_win_rate = agg['wins_a'] / max(decisive, 1)
+        avg_moves = agg['total_moves'] / max(total_games, 1)
+        far_pct = 100 * agg['far_stones'] / max(agg['total_stones'], 1)
+        full_turns = agg['n_full_turns'] + agg['n_quick_turns']
+        full_search_pct = agg['n_full_turns'] / max(full_turns, 1)
+
+        print(f"\n  Multi-GPU round: {self.n_gpus} GPUs, {total_games} games, "
+              f"{pos_played:,} positions in {wall:.1f}s "
+              f"-> {pos_played / max(wall, 1e-9):,.0f} pos/s, "
+              f"{total_games / max(wall, 1e-9) * 60:.1f} games/min")
+        print(f"  Full-search turns: {agg['n_full_turns']}/{full_turns} "
+              f"({100 * full_search_pct:.1f}%)")
+        return (all_examples, draw_rate, a_win_rate, avg_moves, far_pct,
+                full_search_pct, all_lengths)
 
 
 def _pool_worker_fn(worker_id, n_workers, batch_size, n_sims,
@@ -1702,6 +2012,7 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                         shared_bufs.needs_eval[0][gi] = False
                         continue
                     leaves[i] = _sel(slot.tree, slot.game)
+                    apply_virtual_loss(leaves[i])
                     _write_delta(shared_bufs, leaves[i], slot.tree, gi, 0)
 
                 wb.wait()
@@ -1712,6 +2023,9 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                     buf_cur = sim % 2
                     buf_next = (sim + 1) % 2
 
+                    # (1) Select the NEXT sim's leaf (one-sim-ahead) and write
+                    #     its delta into buffer buf_next, applying virtual loss
+                    #     so it diverges from sim's still-in-flight leaf.
                     next_leaves = [None] * n_mine
                     if sim < turn_n_sims - 1:
                         for i, slot in enumerate(slots):
@@ -1720,37 +2034,56 @@ def _pool_worker_loop(worker_id, n_workers, batch_size, n_sims,
                                 shared_bufs.needs_eval[buf_next][gi] = False
                                 continue
                             next_leaves[i] = _sel(slot.tree, slot.game)
+                            apply_virtual_loss(next_leaves[i])
                             _write_delta(shared_bufs, next_leaves[i],
                                          slot.tree, gi, buf_next)
 
+                    # (2) Barrier B1: every worker has written delta[buf_next].
+                    #     Signal the main to start forward(sim+1) NOW -- before we
+                    #     backprop sim -- so the GPU forward overlaps our backprop.
+                    #     forward(sim+1) writes result buffer buf_next, which is
+                    #     distinct from buf_cur we read below (no data race).
+                    wb.wait()
+                    if (worker_id == 0 and sim < turn_n_sims - 1
+                            and _DEPTH2_OVERLAP):
+                        deltas_ready[buf_next].set()
+
+                    # (3) Wait for sim's NN results in buffer buf_cur.
                     if not _wait_event_worker(
-                            results_ready, stop_flag, round_stop,
+                            results_ready[buf_cur], stop_flag, round_stop,
                             label=f"w{worker_id}:results sim={sim}"):
                         break
 
+                    # (4) Backprop sim's results (undo virtual loss first).
                     for i, slot in enumerate(slots):
                         gi = my_start + i
                         if leaves[i] is None:
                             continue
+                        remove_virtual_loss(leaves[i])
                         if not shared_bufs.needs_eval[buf_cur][gi]:
                             _bp(slot.tree, leaves[i], 0.0)
                         else:
-                            nn_val = shared_bufs.values[gi].item()
+                            nn_val = shared_bufs.values[buf_cur][gi].item()
                             _bp(slot.tree, leaves[i], nn_val)
-                            if shared_bufs.has_expand[gi]:
+                            if shared_bufs.has_expand[buf_cur][gi]:
                                 maybe_expand_leaf(
                                     slot.tree, leaves[i],
-                                    shared_bufs.marginals[gi],
-                                    shared_bufs.top_indices[gi],
-                                    shared_bufs.top_values[gi],
+                                    shared_bufs.marginals[buf_cur][gi],
+                                    shared_bufs.top_indices[buf_cur][gi],
+                                    shared_bufs.top_values[buf_cur][gi],
                                     nn_value=nn_val)
 
                     leaves = next_leaves
 
+                    # (5) Barrier B2: every worker has finished reading
+                    #     result[buf_cur]; clear it so the main can reuse it for
+                    #     forward(sim+2). deltas_ready[buf_next] was already
+                    #     signalled at B1, so the main is not blocked here.
                     wb.wait()
                     if worker_id == 0:
-                        results_ready.clear()
-                        if sim < turn_n_sims - 1:
+                        results_ready[buf_cur].clear()
+                        if (not _DEPTH2_OVERLAP
+                                and sim < turn_n_sims - 1):
                             deltas_ready[buf_next].set()
             except BrokenBarrierError:
                 break

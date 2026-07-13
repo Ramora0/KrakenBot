@@ -71,6 +71,7 @@ PUCT_C = 1.0             # standard exploration constant
 FPU_REDUCTION = 0.25     # parent-relative first play urgency (KataGo-style)
 EXPAND_VISITS = 1       # expand on first visit (standard AlphaZero)
 MAX_DEPTH = 50          # safety limit on pair-move depth
+VIRTUAL_LOSS = 1.0      # loss added per in-flight path edge (pipeline diversity)
 NON_ROOT_TOP_K = 50     # candidate pairs for non-root flat selection
 DIRICHLET_ALPHA = 0.0   # unused; alpha is always 10/n
 DIRICHLET_FRAC = 0.25   # standard AlphaZero noise fraction
@@ -1030,6 +1031,43 @@ def expand_and_backprop(
         node.visits[local] += 1
         node.values[local] += sign * value_for_mover
         node.visit_count += 1
+
+
+# ---------------------------------------------------------------------------
+# Virtual loss (pipeline parallelism)
+# ---------------------------------------------------------------------------
+#
+# The self-play pipeline selects sim K+1's leaf *before* sim K is backpropped
+# (one-sim-delayed pipeline in parallel_selfplay._pool_worker_loop). Without a
+# discouragement, K+1's PUCT sees a tree missing K's visit and can re-select
+# the same leaf -- wasted work. Virtual loss temporarily adds a losing visit to
+# every edge on an in-flight path so a concurrent selection diverges. It is
+# fully removed at backprop, so final visit counts / policy targets are
+# unaffected.
+#
+# Q = values[local] / visits[local] is always in the perspective of the mover
+# at that node (see expand_and_backprop), so a "loss for whoever chose the
+# edge" is a uniform -VIRTUAL_LOSS on every edge -- no depth sign alternation.
+# These operate on leaf.path directly, so they work identically for LeafInfo
+# produced by select_leaf or select_leaf_cy (nodes are plain Python objects).
+
+
+def apply_virtual_loss(leaf: LeafInfo):
+    """Add a virtual losing visit to each edge on the selected path."""
+    for node, action_idx in leaf.path:
+        local = node.action_map[action_idx]
+        node.visits[local] += 1
+        node.values[local] -= VIRTUAL_LOSS
+        node.visit_count += 1
+
+
+def remove_virtual_loss(leaf: LeafInfo):
+    """Undo apply_virtual_loss. Call once, right before backprop."""
+    for node, action_idx in leaf.path:
+        local = node.action_map[action_idx]
+        node.visits[local] -= 1
+        node.values[local] += VIRTUAL_LOSS
+        node.visit_count -= 1
 
 
 # ---------------------------------------------------------------------------

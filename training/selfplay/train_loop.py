@@ -1386,6 +1386,11 @@ def main():
                         help="Directory for self-play data")
     parser.add_argument("--amp", action="store_true",
                         help="Use automatic mixed precision")
+    parser.add_argument("--inference-dtype", choices=["bf16", "fp16", "fp32"],
+                        default="bf16",
+                        help="Dtype for self-play/eval inference. bf16 needs "
+                             "Ampere+ (sm_80); use fp16 or fp32 on V100/Volta "
+                             "(sm_70). (default: bf16)")
     parser.add_argument("--no-wandb", action="store_true",
                         help="Disable wandb logging")
     parser.add_argument("--num-blocks", type=int, default=10)
@@ -1417,7 +1422,12 @@ def main():
     parser.add_argument("--no-parallel", action="store_true",
                         help="Disable parallel self-play (use sequential)")
     parser.add_argument("--n-workers", type=int, default=8,
-                        help="Number of worker processes for parallel self-play")
+                        help="Total worker processes for parallel self-play "
+                             "(split across GPUs in multi-GPU mode)")
+    parser.add_argument("--gpus", type=int, default=None,
+                        help="Number of GPUs to shard self-play generation "
+                             "across (default: all visible CUDA devices; "
+                             "1 forces the single-GPU path)")
     parser.add_argument("--evaluate", action="store_true",
                         help="Run evaluation immediately on startup before training")
     parser.add_argument("--no-eval", action="store_true",
@@ -1426,6 +1436,12 @@ def main():
                         help="Delete all selfplay data, checkpoints, and wandb logs, "
                              "then restart from --resume model weights")
     args = parser.parse_args()
+
+    inference_dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }[args.inference_dtype]
 
     if args.refresh:
         if not args.resume:
@@ -1597,32 +1613,54 @@ def main():
     use_parallel = (device.type == 'cuda'
                     and args.batch_size >= 16
                     and not args.no_parallel)
+
+    # Decide how many GPUs to shard self-play generation across.
+    n_gpus = 1
+    if use_parallel:
+        avail = torch.cuda.device_count()
+        n_gpus = avail if args.gpus is None else min(args.gpus, avail)
+        n_gpus = max(1, n_gpus)
+    multi_gpu = use_parallel and n_gpus > 1
+
     pool = None
+    is_cold_start = True
     if use_parallel:
         from training.selfplay.parallel_selfplay import (
-            ParallelSelfPlayPool, COLD_START_GAMES, COMPLETED_PER_ROUND,
+            ParallelSelfPlayPool, MultiGPUSelfPlayPool,
+            COLD_START_GAMES, COMPLETED_PER_ROUND,
         )
-        pending_path = os.path.join(args.data_dir, "pending.json")
-        game_dicts = [None] * args.batch_size
-        next_game_id = 0
-        is_cold_start = True
-        if os.path.exists(pending_path):
-            with open(pending_path, 'r') as f:
-                pd = json.load(f)
-            for i, item in enumerate(pd["games"][:args.batch_size]):
-                game_dicts[i] = item
-            next_game_id = pd["next_game_id"]
-            is_cold_start = False
-            print(f"Resumed {len(pd['games'])} in-progress games")
-        else:
-            next_game_id = args.batch_size
+        model_dtype = inference_dtype  # inference dtype (see --inference-dtype)
 
-        model_dtype = torch.bfloat16  # inference runs in bfloat16
-        pool = ParallelSelfPlayPool(
-            args.batch_size, args.n_sims, args.n_workers, model_dtype,
-            n_sims_full=args.n_sims_full,
-            full_search_prob=args.full_search_prob)
-        pool.start(game_dicts, next_game_id)
+        if multi_gpu:
+            devices = [torch.device(f"cuda:{i}") for i in range(n_gpus)]
+            print(f"\nMulti-GPU self-play: sharding generation across "
+                  f"{n_gpus} GPUs")
+            pool = MultiGPUSelfPlayPool(
+                devices, args.batch_size, args.n_sims, args.n_workers,
+                model_dtype, n_sims_full=args.n_sims_full,
+                full_search_prob=args.full_search_prob)
+            pool.start(args.data_dir)
+            is_cold_start = pool.is_cold_start
+        else:
+            pending_path = os.path.join(args.data_dir, "pending.json")
+            game_dicts = [None] * args.batch_size
+            next_game_id = 0
+            if os.path.exists(pending_path):
+                with open(pending_path, 'r') as f:
+                    pd = json.load(f)
+                for i, item in enumerate(pd["games"][:args.batch_size]):
+                    game_dicts[i] = item
+                next_game_id = pd["next_game_id"]
+                is_cold_start = False
+                print(f"Resumed {len(pd['games'])} in-progress games")
+            else:
+                next_game_id = args.batch_size
+
+            pool = ParallelSelfPlayPool(
+                args.batch_size, args.n_sims, args.n_workers, model_dtype,
+                n_sims_full=args.n_sims_full,
+                full_search_prob=args.full_search_prob)
+            pool.start(game_dicts, next_game_id)
 
     try:
         round_num = start_round
@@ -1636,7 +1674,7 @@ def main():
             from training.selfplay.self_play import SelfPlayManager
             print(f"\n--- Self-play ---")
             model.eval()
-            model.bfloat16()
+            model.to(inference_dtype)
 
             if use_parallel:
                 target = COLD_START_GAMES if (
@@ -1752,9 +1790,9 @@ def main():
                       f"{args.eval_sims} sims ---")
                 t2 = time.time()
                 model.eval()
-                if use_parallel and pool is not None:
-                    model.bfloat16()
-                    anchor_model.bfloat16()
+                if use_parallel and pool is not None and not multi_gpu:
+                    model.to(inference_dtype)
+                    anchor_model.to(inference_dtype)
                     eval_result = pool.evaluate(
                         (model, anchor_model), device,
                         n_games=args.eval_games,
@@ -1763,6 +1801,9 @@ def main():
                     model.float()
                     anchor_model.float()
                 else:
+                    # Multi-GPU mode keeps evaluation single-GPU (the sub-pool
+                    # batches are too small to host a full eval), using the
+                    # main-process batched-MCTS path.
                     eval_result = evaluate_vs_anchor(
                         model, anchor_model, device,
                         n_games=args.eval_games,
