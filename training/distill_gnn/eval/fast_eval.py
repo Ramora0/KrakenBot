@@ -60,7 +60,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--a-ckpt", required=True)
     ap.add_argument("--a-name", default="student")
-    ap.add_argument("--a-time-ms", type=float, required=True)
+    ap.add_argument("--a-time-ms", type=float, default=None)
+    ap.add_argument("--a-sims", type=int, default=None,
+                    help="fixed-sims mode for A (instead of --a-time-ms); used "
+                         "for Elo-vs-sims curves")
     ap.add_argument("--a-log-temp", type=float, default=None)
     ap.add_argument("--b-log-temp", type=float, default=None)
     ap.add_argument("--b-strix", action="store_true")
@@ -105,9 +108,13 @@ def main():
             continue
         out = (args.out or "fast_eval") + f".w{w}.json"
         outs.append(out)
+        if (args.a_time_ms is None) == (args.a_sims is None):
+            raise SystemExit("pass exactly one of --a-time-ms / --a-sims")
+        a_budget = (["--a-time-ms", str(args.a_time_ms)] if args.a_time_ms is not None
+                    else ["--a-sims", str(args.a_sims)])
         cmd = [sys.executable, "-u", "-m", "training.distill_gnn.eval.referee",
                "--a-ckpt", args.a_ckpt, "--a-name", args.a_name,
-               "--a-time-ms", str(args.a_time_ms),
+               *a_budget,
                "--games", str(n), "--seed", str(args.seed + 10000 * (w + 1)),
                "--out", out]
         if openings:
