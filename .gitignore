@@ -17,3 +17,5 @@ training/mcts_results/
 training/resnet_results/
 training/data/*_cache/
 training/selfplay/crash_worker*.log
+training/distill_gnn/data/
+training/distill_gnn/results/

@@ -660,10 +660,11 @@ def _expand_level2(
     if tree._root_nearby is not None:
         # Extend cached root nearby set with stone1's own neighbors
         _bw = tree.board_width
-        if _bw == BOARD_SIZE:
+        if _bw == BOARD_SIZE and tree.n_cells == BOARD_SIZE * BOARD_SIZE:
             table = _NEIGHBORS_WITHIN[MAX_CAND_DIST]
             stone1_neighbors = table[stone1_idx]
         else:
+            # dynamic grid (h or w != BOARD_SIZE; h*w cells, possibly h != w)
             stone1_neighbors = _nearby_candidates_dynamic(
                 {stone1_idx}, _bw, tree.n_cells // _bw)
         cand_set = tree._root_nearby | stone1_neighbors
@@ -675,7 +676,7 @@ def _expand_level2(
         occ_idx = set(
             _cell_to_idx(q, r, _bw) for q, r in tree.root_occupied
         ) | {stone1_idx}
-        if _bw == BOARD_SIZE:
+        if _bw == BOARD_SIZE and tree.n_cells == BOARD_SIZE * BOARD_SIZE:
             cand_indices = list(_nearby_candidates(occ_idx))
         else:
             _bh = tree.n_cells // _bw
@@ -833,8 +834,13 @@ def select_leaf(tree: MCTSTree, game) -> LeafInfo:
             pair_depths.append(depth)
 
             state = game.save_state()
+            if not game.make_move(s1_q, s1_r):
+                # Cell occupied on the proxy (torus wrap collision when the
+                # real board spans > torus width). Abort this sim cleanly.
+                _undo_all(game, states)
+                return LeafInfo(path=path, pair_depths=pair_depths,
+                                is_terminal=True, terminal_value=0.0)
             states.append((s1_q, s1_r, state))
-            game.make_move(s1_q, s1_r)
 
             ch = depth % 2
             deltas.append((s1_q, s1_r, ch))
@@ -879,8 +885,11 @@ def select_leaf(tree: MCTSTree, game) -> LeafInfo:
             pair_depths.append(depth)
 
             state = game.save_state()
+            if not game.make_move(s2_q, s2_r):
+                _undo_all(game, states)
+                return LeafInfo(path=path, pair_depths=pair_depths,
+                                is_terminal=True, terminal_value=0.0)
             states.append((s2_q, s2_r, state))
-            game.make_move(s2_q, s2_r)
             deltas.append((s2_q, s2_r, ch))
 
             # Terminal after stone_2?
@@ -934,8 +943,11 @@ def select_leaf(tree: MCTSTree, game) -> LeafInfo:
 
             # Make stone_1
             state = game.save_state()
+            if not game.make_move(s1_q, s1_r):
+                _undo_all(game, states)
+                return LeafInfo(path=path, pair_depths=pair_depths,
+                                is_terminal=True, terminal_value=0.0)
             states.append((s1_q, s1_r, state))
-            game.make_move(s1_q, s1_r)
             deltas.append((s1_q, s1_r, ch))
 
             if game.game_over:
@@ -949,8 +961,11 @@ def select_leaf(tree: MCTSTree, game) -> LeafInfo:
 
             # Make stone_2
             state = game.save_state()
+            if not game.make_move(s2_q, s2_r):
+                _undo_all(game, states)
+                return LeafInfo(path=path, pair_depths=pair_depths,
+                                is_terminal=True, terminal_value=0.0)
             states.append((s2_q, s2_r, state))
-            game.make_move(s2_q, s2_r)
             deltas.append((s2_q, s2_r, ch))
 
             if game.game_over:

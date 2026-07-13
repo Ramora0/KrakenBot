@@ -5,13 +5,15 @@ Dual-head model predicting win rate (value) and move PAIR probabilities
 
 Architecture:
   - Conv stem + N residual blocks (GroupNorm, size-independent)
-  - Value head: masked global average pooling → FC → tanh
+  - Value head: masked global average pooling → FC → 3-way categorical
+    distribution over {lose, draw, win}
   - Policy head: bilinear attention over cell embeddings → N×N pair logits
     Symmetrized (order of stones in a pair doesn't matter),
     diagonal masked (can't place both on same cell).
 """
 
 import json
+import math
 
 import torch
 import torch.nn as nn
@@ -47,18 +49,36 @@ class PairPolicyHead(nn.Module):
         super().__init__()
         self.q_proj = nn.Conv2d(channels, head_dim, 1)
         self.k_proj = nn.Conv2d(channels, head_dim, 1)
-        self.scale = head_dim ** -0.5
+        self.scale = head_dim ** -0.5  # legacy dot-product scale
+        # Cosine-similarity logits scaled by a learnable temperature. This
+        # replaces a hard clamp(-100, 100) on unbounded dot-product logits,
+        # which created a zero-gradient dead zone: training drove all logits to
+        # the +100 ceiling, collapsing the policy to uniform (unlearnable). With
+        # unit-norm q/k the logits live in [-temp, temp] with smooth gradients
+        # everywhere, so the pair policy can actually be trained.
+        self.log_temp = nn.Parameter(torch.tensor(math.log(20.0)))
+        # False -> normalized-QK temperature path (fixed). True -> original
+        # clamp path, set automatically when loading a pre-fix checkpoint (which
+        # lacks log_temp) so old weights still evaluate as trained. See
+        # HexResNet.load_state_dict below.
+        self.register_buffer("legacy_clamp", torch.tensor(False))
 
     def forward(self, trunk_features, mask=None):
         B, C, H, W = trunk_features.shape
         N = H * W
 
-        Q = self.q_proj(trunk_features).flatten(2)  # [B, d, N]
-        K = self.k_proj(trunk_features).flatten(2)  # [B, d, N]
-
-        A = torch.bmm(Q.transpose(1, 2), K) * self.scale  # [B, N, N]
-        A = (A + A.transpose(1, 2)) / 2  # symmetrize
-        A = A.clamp(-100, 100)  # prevent extreme logits
+        if bool(self.legacy_clamp):
+            Q = self.q_proj(trunk_features).flatten(2)
+            K = self.k_proj(trunk_features).flatten(2)
+            A = torch.bmm(Q.transpose(1, 2), K) * self.scale
+            A = (A + A.transpose(1, 2)) / 2
+            A = A.clamp(-100, 100)
+        else:
+            Q = F.normalize(self.q_proj(trunk_features).flatten(2), dim=1)  # [B, d, N]
+            K = F.normalize(self.k_proj(trunk_features).flatten(2), dim=1)  # [B, d, N]
+            temp = self.log_temp.clamp(max=math.log(100.0)).exp()
+            A = torch.bmm(Q.transpose(1, 2), K) * temp  # cosine sim in [-1,1] * temp
+            A = (A + A.transpose(1, 2)) / 2  # symmetrize
 
         # Mask diagonal (can't place both stones on same cell)
         diag = torch.eye(N, device=A.device, dtype=torch.bool).unsqueeze(0)
@@ -76,8 +96,9 @@ class PairPolicyHead(nn.Module):
 class HexResNet(nn.Module):
     def __init__(self, in_channels=2, num_blocks=10, num_filters=128,
                  gn_groups=8, v_channels=32, pair_head_dim=64,
-                 chain_channels=32):
+                 chain_channels=32, value_head="wdl"):
         super().__init__()
+        self.value_head = value_head  # "wdl" (3-way categorical) or "scalar" (legacy)
 
         # Stem
         self.stem_conv = nn.Conv2d(in_channels, num_filters, 3, padding=1,
@@ -89,11 +110,14 @@ class HexResNet(nn.Module):
             *[ResBlock(num_filters, gn_groups) for _ in range(num_blocks)]
         )
 
-        # Value head: conv → mean+max pool → FC
+        # Value head: conv → mean+max pool → FC → 3-way categorical
+        # (logits over {lose, draw, win})
         self.v_conv = nn.Conv2d(num_filters, v_channels, 1, bias=False)
         self.v_gn = nn.GroupNorm(gn_groups, v_channels)
         self.v_fc1 = nn.Linear(v_channels * 2, 256)  # mean + max = 2x channels
-        self.v_fc2 = nn.Linear(256, 1)
+        self.v_fc2 = nn.Linear(256, 3 if value_head == "wdl" else 1)
+        # Scalar values associated with each outcome bin, for expected value.
+        self.register_buffer("value_bins", torch.tensor([-1.0, 0.0, 1.0]))
 
         # Moves-left head: same pooled vector as value → FC → ReLU → FC
         self.ml_fc1 = nn.Linear(v_channels * 2, 256)
@@ -116,7 +140,7 @@ class HexResNet(nn.Module):
             mask: [B, 1, H, W] float mask (1=valid, 0=padding). None=all valid.
 
         Returns:
-            value: [B] scalar in [-1, 1]
+            value_logits: [B, 3] categorical logits over {lose, draw, win}
             pair_logits: [B, N, N] raw pair logits (diagonal=-inf, padding=-inf)
             moves_left: [B] predicted remaining moves (>= 0)
             chain: [B, 6, H, W] per-cell per-direction unblocked chain length
@@ -134,8 +158,8 @@ class HexResNet(nn.Module):
             v_max = v_feat.amax(dim=[2, 3])
         v_pooled = torch.cat([v_mean, v_max], dim=-1)  # [B, 2*v_ch]
 
-        # Value head
-        value = torch.tanh(self.v_fc2(F.relu(self.v_fc1(v_pooled)))).squeeze(-1)
+        # Value head: 3-way categorical logits over {lose, draw, win}
+        value_logits = self.v_fc2(F.relu(self.v_fc1(v_pooled)))  # [B, 3]
 
         # Moves-left head (from same pooled vector)
         moves_left = F.relu(self.ml_fc2(F.relu(self.ml_fc1(v_pooled)))).squeeze(-1)
@@ -146,7 +170,18 @@ class HexResNet(nn.Module):
         # Chain head: per-cell per-direction chain for current/opponent
         chain = self.chain_conv2(F.relu(self.chain_conv1(t)))  # [B, 6, H, W]
 
-        return value, pair_logits, moves_left, chain
+        return value_logits, pair_logits, moves_left, chain
+
+    def expected_value(self, value_logits):
+        """Expected scalar value in [-1, 1] from categorical logits.
+
+        E[value] = sum_k P(k) * value_bins[k], with bins {lose:-1, draw:0, win:1}.
+        Returns [B].
+        """
+        if getattr(self, "value_head", "wdl") == "scalar":
+            return value_logits.squeeze(-1).clamp(-1.0, 1.0)  # legacy regression head
+        probs = F.softmax(value_logits, dim=-1)
+        return probs @ self.value_bins
 
     @staticmethod
     def marginalize(pair_logits):
@@ -162,6 +197,43 @@ class HexResNet(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 m.padding_mode = mode
+
+    def load_state_dict(self, state_dict, strict=True, **kw):
+        """Back-compat: a checkpoint saved before the pair-head fix has no
+        ``pair_head.log_temp``. Load it into the original clamp path so the old
+        weights evaluate exactly as they were trained (and ignore the new head
+        params, which stay at init and are unused in legacy mode)."""
+        if "pair_head.log_temp" not in state_dict:
+            self.pair_head.legacy_clamp = torch.tensor(True)
+            return super().load_state_dict(state_dict, strict=False, **kw)
+        if strict and "pair_head.legacy_clamp" not in state_dict:
+            # new-style (has log_temp) but predates the legacy_clamp buffer
+            state_dict = dict(state_dict)
+            state_dict["pair_head.legacy_clamp"] = self.pair_head.legacy_clamp
+        return super().load_state_dict(state_dict, strict=strict, **kw)
+
+    @classmethod
+    def from_checkpoint(cls, path, map_location="cpu", **overrides):
+        """Construct a model matching a saved checkpoint and load it, inferring
+        num_blocks / num_filters / value_head / legacy-pair-head automatically.
+        Works for both the new WDL/temperature checkpoints and old
+        scalar-value/clamp-pair Kraken checkpoints. Returns the loaded model."""
+        obj = torch.load(path, map_location=map_location, weights_only=False)
+        if isinstance(obj, dict):
+            sd = (obj.get("model_state_dict") or obj.get("model")
+                  or obj.get("state_dict") or obj)
+        else:
+            sd = obj
+        num_filters = sd["stem_conv.weight"].shape[0]
+        num_blocks = sum(1 for k in sd
+                         if k.startswith("blocks.") and k.endswith(".conv1.weight"))
+        value_head = "scalar" if sd["v_fc2.weight"].shape[0] == 1 else "wdl"
+        kwargs = dict(num_blocks=num_blocks, num_filters=num_filters,
+                      value_head=value_head)
+        kwargs.update(overrides)
+        model = cls(**kwargs)
+        model.load_state_dict(sd)
+        return model
 
 
 def board_to_planes(board_dict, current_player, pad_to=None, min_size=None,
@@ -257,13 +329,16 @@ if __name__ == "__main__":
         v, pair, ml, chain = model(x, mask)
         N = size * size
         single = HexResNet.marginalize(pair)
+        ev = model.expected_value(v)
         print(f"  {size}x{size}: value={v.shape}, pair={pair.shape}, "
               f"moves_left={ml.shape}, chain={chain.shape}, "
-              f"v=[{v.min().item():.3f}, {v.max().item():.3f}]")
+              f"E[v]=[{ev.min().item():.3f}, {ev.max().item():.3f}]")
 
         # Verify symmetry and diagonal masking
         assert torch.allclose(pair, pair.transpose(1, 2)), "Not symmetric!"
         assert (pair[:, range(N), range(N)] == float("-inf")).all(), "Diagonal not masked!"
+        assert v.shape == (4, 3), f"value shape wrong: {v.shape}"
+        assert ((ev >= -1) & (ev <= 1)).all(), "expected value out of range"
         assert ml.shape == (4,), f"moves_left shape wrong: {ml.shape}"
         assert chain.shape == (4, 6, size, size), f"chain shape wrong: {chain.shape}"
         assert (ml >= 0).all(), "moves_left should be non-negative"
