@@ -40,21 +40,6 @@ class _ScalarValueModel(nn.Module):
         self.base.set_padding_mode(mode)
 
 
-def _virtual_loss(leaf, sign_mult):
-    """Apply (sign_mult=+1) or revert (sign_mult=-1) a virtual loss along
-    leaf.path: pretend the playout was lost for the leaf's mover so parallel
-    selections within one eval batch diverge instead of picking the same leaf."""
-    if not leaf.path:
-        return
-    d = leaf.pair_depths[-1]
-    for (node, a), k in zip(leaf.path, leaf.pair_depths):
-        sign = 1 if (d - k) % 2 == 0 else -1
-        local = node.action_map[a]
-        node.visits[local] += sign_mult
-        node.values[local] += sign_mult * sign * -1.0
-        node.visit_count += sign_mult
-
-
 class KrakenAgent:
     def __init__(self, model_path, n_sims=200, time_budget_ms=None, device=None,
                  max_sims=200000, name=None, eval_batch=12, log_temp=None):
@@ -143,6 +128,7 @@ class KrakenAgent:
         """Collect up to eval_batch leaves under virtual loss, evaluate them in
         ONE forward, then revert + backprop. Terminal leaves backprop
         immediately. Returns the number of sims performed."""
+        from mcts.tree import apply_virtual_loss, remove_virtual_loss
         budget = self.eval_batch if limit is None else min(self.eval_batch, limit)
         done = 0
         leaves = []
@@ -152,7 +138,7 @@ class KrakenAgent:
                 expand_and_backprop(tree, leaf, 0.0)
                 done += 1
                 continue
-            _virtual_loss(leaf, +1)
+            apply_virtual_loss(leaf)
             leaves.append(leaf)
         if not leaves:
             return max(done, 1)
@@ -161,7 +147,7 @@ class KrakenAgent:
                         ).to(self.device)
         value, pair_logits, _, _ = self.model(x)  # scalar [B,1] via adapter
         for i, leaf in enumerate(leaves):
-            _virtual_loss(leaf, -1)
+            remove_virtual_loss(leaf)
             nn_val = value[i, 0].item()
             expand_and_backprop(tree, leaf, nn_val)
             if leaf.needs_expansion:
