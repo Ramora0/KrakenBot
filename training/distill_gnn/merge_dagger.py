@@ -55,10 +55,18 @@ def main():
     print(f"human: {n_human:,} records, {len(human_keys):,} unique keys")
 
     seen = set(human_keys)
+    # new dagger shards must not collide with shards hardlinked from the human
+    # dir (which may itself be a previous merge containing shard_9000N files)
+    def _idx(p):
+        stem = os.path.basename(p)[len("shard_"):-len(".jsonl.gz")]
+        return int(stem) if stem.isdigit() else -1
+    next_idx = 1 + max(
+        [_idx(p) for p in glob.glob(os.path.join(args.out_dir, "shard_*.jsonl.gz"))]
+        + [89999])
     for d_i, ddir in enumerate(args.dagger_dir):
         kept = dropped = 0
         gid_off = args.gid_base * (d_i + 1)
-        out_path = os.path.join(args.out_dir, f"shard_9000{d_i}.jsonl.gz")
+        out_path = os.path.join(args.out_dir, f"shard_{next_idx + d_i:05d}.jsonl.gz")
         with gzip.open(out_path + ".tmp", "wt", encoding="utf-8") as out:
             for path in sorted(glob.glob(os.path.join(ddir, "shard_*.jsonl.gz"))):
                 with gzip.open(path, "rt", encoding="utf-8") as f:
