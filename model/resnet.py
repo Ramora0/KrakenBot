@@ -22,6 +22,64 @@ import torch.nn.functional as F
 BOARD_SIZE = 25
 
 
+class ThreatStem(nn.Module):
+    """Fixed (non-learned) strix-style threat features from the 2 stone planes.
+
+    For each player p and each cell c: the number of OPEN win windows
+    (win_length consecutive cells along one of the 3 hex axes, containing c,
+    with zero opponent stones) holding >= n stones of p, for n in {2,3,4,5}.
+    8 planes total (4 thresholds x 2 players), scaled by 1/6 per threshold.
+
+    Axes in (q, r) plane coords: (1,0) = dim H, (0,1) = dim W, (1,-1) = the
+    anti-diagonal. Zero padding is semantically exact here: the game board is
+    infinite, so cells beyond the crop are genuinely open empties.
+
+    Everything is two all-ones convolutions per axis (window sums, then
+    window->cell coverage), so it runs fused on GPU inside the forward pass —
+    no per-leaf CPU cost in the batched search.
+    """
+
+    THRESHOLDS = (2, 3, 4, 5)
+    OUT_CHANNELS = 2 * len(THRESHOLDS)
+
+    def __init__(self, win_length=6):
+        super().__init__()
+        L = self.win_length = win_length
+        kv = torch.zeros(1, 1, L, 1); kv[0, 0, :, 0] = 1.0
+        kh = torch.zeros(1, 1, 1, L); kh[0, 0, 0, :] = 1.0
+        kd = torch.zeros(1, 1, L, L)
+        for j in range(L):
+            kd[0, 0, j, L - 1 - j] = 1.0
+        self.register_buffer("kv", kv, persistent=False)
+        self.register_buffer("kh", kh, persistent=False)
+        self.register_buffer("kd", kd, persistent=False)
+
+    def _axis_counts(self, P, O, k, pad_w):
+        """Per-cell count of open windows containing the cell with >= n stones
+        of P, along one axis. The window pass pads by win_length-1 on both ends
+        of the axis dims (pad_w, (l,r,t,b)); the coverage pass is then an exact
+        valid conv with the same kernel. Returns [B, 4, H, W]."""
+        Wp = F.conv2d(F.pad(P, pad_w), k)
+        Wo = F.conv2d(F.pad(O, pad_w), k)
+        open_w = (Wo == 0).float()
+        outs = []
+        for n in self.THRESHOLDS:
+            hit = (Wp >= n).float() * open_w
+            outs.append(F.conv2d(hit, k))
+        return torch.cat(outs, dim=1)
+
+    def forward(self, x):
+        L = self.win_length - 1
+        feats = []
+        for P, O in ((x[:, 0:1], x[:, 1:2]), (x[:, 1:2], x[:, 0:1])):
+            per_axis = (
+                self._axis_counts(P, O, self.kv, (0, 0, L, L)) +
+                self._axis_counts(P, O, self.kh, (L, L, 0, 0)) +
+                self._axis_counts(P, O, self.kd, (L, L, L, L)))
+            feats.append(per_axis)
+        return torch.cat(feats, dim=1) / 6.0
+
+
 class ResBlock(nn.Module):
     def __init__(self, channels, gn_groups=8):
         super().__init__()
@@ -96,12 +154,17 @@ class PairPolicyHead(nn.Module):
 class HexResNet(nn.Module):
     def __init__(self, in_channels=2, num_blocks=10, num_filters=128,
                  gn_groups=8, v_channels=32, pair_head_dim=64,
-                 chain_channels=32, value_head="wdl"):
+                 chain_channels=32, value_head="wdl", threat_stem=False):
         super().__init__()
         self.value_head = value_head  # "wdl" (3-way categorical) or "scalar" (legacy)
 
+        # Optional fixed strix-style threat features derived from the stone
+        # planes on the fly (adds ThreatStem.OUT_CHANNELS input channels).
+        self.threat = ThreatStem() if threat_stem else None
+        stem_in = in_channels + (ThreatStem.OUT_CHANNELS if threat_stem else 0)
+
         # Stem
-        self.stem_conv = nn.Conv2d(in_channels, num_filters, 3, padding=1,
+        self.stem_conv = nn.Conv2d(stem_in, num_filters, 3, padding=1,
                                    padding_mode='circular', bias=False)
         self.stem_gn = nn.GroupNorm(gn_groups, num_filters)
 
@@ -145,6 +208,9 @@ class HexResNet(nn.Module):
             moves_left: [B] predicted remaining moves (>= 0)
             chain: [B, 6, H, W] per-cell per-direction unblocked chain length
         """
+        if self.threat is not None:
+            with torch.no_grad():
+                x = torch.cat([x, self.threat(x[:, :2])], dim=1)
         s = F.relu(self.stem_gn(self.stem_conv(x)))
         t = self.blocks(s)
 
@@ -228,8 +294,9 @@ class HexResNet(nn.Module):
         num_blocks = sum(1 for k in sd
                          if k.startswith("blocks.") and k.endswith(".conv1.weight"))
         value_head = "scalar" if sd["v_fc2.weight"].shape[0] == 1 else "wdl"
+        threat_stem = sd["stem_conv.weight"].shape[1] > 2
         kwargs = dict(num_blocks=num_blocks, num_filters=num_filters,
-                      value_head=value_head)
+                      value_head=value_head, threat_stem=threat_stem)
         kwargs.update(overrides)
         model = cls(**kwargs)
         model.load_state_dict(sd)

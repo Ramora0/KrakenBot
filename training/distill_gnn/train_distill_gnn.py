@@ -267,7 +267,8 @@ def train(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    model = HexResNet(num_blocks=args.num_blocks, num_filters=args.num_filters).to(device)
+    model = HexResNet(num_blocks=args.num_blocks, num_filters=args.num_filters,
+                      threat_stem=args.threat_stem).to(device)
     if args.init_from:
         ckpt = torch.load(args.init_from, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
@@ -379,6 +380,9 @@ def main():
     ap.add_argument("--w-value", type=float, default=1.0)
     ap.add_argument("--w-policy", type=float, default=1.0)
     ap.add_argument("--w-chain", type=float, default=0.1)
+    ap.add_argument("--threat-stem", action="store_true",
+                    help="derive fixed strix-style threat planes inside the "
+                         "model (8 extra stem input channels)")
     ap.add_argument("--w-marg", type=float, default=0.5,
                     help="weight of the top-32 marginal CE aux loss (root PUCT "
                          "consumes the marginal; joint CE only covers top-8)")
