@@ -169,6 +169,16 @@ def run_match(agent1, agent2, games, seed=0, label1="A1", label2="A2",
     w1 = w2 = draws = 0
     a1_ms, a2_ms = [], []
     mined, mined_seen = [], set()
+
+    def _release_vram():
+        # Long matches slowly fragment the CUDA caching allocator (dynamic
+        # tree sizes) until the box hits the 16GB WDDM paging livelock at
+        # ~65-70 min. Releasing cached blocks once per game costs ~ms and
+        # keeps multi-hour matches stable.
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     for g in range(games):
         op = openings[(g // 2) % len(openings)] if openings else None
         states = [] if dump_lost_states else None
@@ -204,6 +214,7 @@ def run_match(agent1, agent2, games, seed=0, label1="A1", label2="A2",
         print(f"  game {g+1}/{games}: {label1} {w1} - {w2} {label2} "
               f"(draws {draws})  {label1}_score={s1:.3f}  last={winner} in {n} stones",
               flush=True)
+        _release_vram()
     score1 = (w1 + 0.5 * draws) / max(games, 1)
     e, elo_lo, elo_hi = elo_diff(score1, games)
     return {"label1": label1, "label2": label2, "games": games,
