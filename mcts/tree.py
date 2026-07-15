@@ -67,8 +67,12 @@ from model.resnet import BOARD_SIZE
 # Constants
 # ---------------------------------------------------------------------------
 
-PUCT_C = 1.0             # standard exploration constant
-FPU_REDUCTION = 0.25     # parent-relative first play urgency (KataGo-style)
+import os as _os
+# Overridable via env for search-hyperparameter sweeps. Read at import time:
+# the Python PUCT path binds PUCT_C as a def-time default, so these must be
+# set BEFORE mcts.tree is imported.
+PUCT_C = float(_os.environ.get("KRAKEN_PUCT_C", "1.0"))       # exploration constant
+FPU_REDUCTION = float(_os.environ.get("KRAKEN_FPU", "0.25"))  # first play urgency reduction
 EXPAND_VISITS = 1       # expand on first visit (standard AlphaZero)
 MAX_DEPTH = 50          # safety limit on pair-move depth
 VIRTUAL_LOSS = 1.0      # loss added per in-flight path edge (pipeline diversity)
